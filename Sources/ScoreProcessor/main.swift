@@ -51,7 +51,7 @@ try await awsClient.shutdown()
 // MARK: ScoreProcessor Utilities
 
 private func isFootballGame(game: GameItem) -> Bool {
-    game.sport == "cfb" || game.sport == "nfl"
+    Sport(rawValue: game.sport)?.isFootball ?? false
 }
 
 private func parseDynamoEventIntoGameItem(event: DynamoDBEvent.EventRecord, context: LambdaContext) -> GameInfo? {
@@ -115,35 +115,36 @@ private func myTeamWon(_ gameInfo: GameInfo) -> Bool {
 }
 
 private func flashLightsAppropriateColors(gameInfo: GameInfo, context: LambdaContext) async throws {
-    switch gameInfo.currentGame.myTeam {
-    case "Tulsa":
-        context.logger.info("Tulsa won or scored! Flashing lights Tulsa colors...")
-        try await flashLights(.tulsa, context: context)
-    case "Eagles":
-        context.logger.info("Eagles won or scored! Flashing lights Eagles colors...")
-        try await flashLights(.eagles, context: context)
-    default:
-        context.logger.info("Some other team won or scored? Flashing lights Tulsa colors anyway...")
-        try await flashLights(.tulsa, context: context)
+    let teamName = gameInfo.currentGame.myTeam
+    guard let team = MonitoredTeam.named(teamName) else {
+        context.logger.error("\(teamName) won or scored but isn't in MonitoredTeam.all, so there are no colors to flash")
+        return
     }
+    context.logger.info("\(teamName) won or scored! Flashing lights \(teamName) colors...")
+    try await flashLights(team.colors, context: context)
 }
 
 // MARK: Hue
 
 // Each color change is one request to the zone's grouped_light, so the bridge switches every light at once.
 // Steps are scheduled against fixed deadlines rather than after each response, so API latency can't drift the cadence.
+// The lights are put back to whatever they were doing before the flash once it ends.
 private func flashLights(_ colors: TeamColors, context: LambdaContext) async throws {
     guard let hueApplicationKey = try await getSSMParameterValue(parameterName: "hue-remote-username", ssm: ssm, context: context) else { return }
     guard let hueAccessToken = try await getSSMParameterValue(parameterName: "hue-access-token", ssm: ssm, context: context) else { return }
     let hue = HueClient(applicationKey: hueApplicationKey, accessToken: hueAccessToken)
 
-    guard let groupedLightId = await hue.groupedLightId(forZoneNamed: gameDayZoneName, context: context) else { return }
+    guard let zone = await hue.zone(named: gameDayZoneName, context: context) else { return }
+    let previousStates = await hue.lightStates(in: zone, context: context)
+    if previousStates.isEmpty {
+        context.logger.warning("Couldn't read the lights in \(gameDayZoneName) before flashing, so they won't be restored afterward")
+    }
 
     let encoder = JSONEncoder()
     let bodies = try [colors.primary, colors.secondary].map { color in
         try encoder.encode(GroupedLightUpdate(color: color, transition: flashTransition))
     }
-    let path = "grouped_light/\(groupedLightId)"
+    let path = "grouped_light/\(zone.groupedLightId)"
 
     // The first change is sent on its own so an expired token or unreachable zone fails once instead of ten times.
     guard await hue.put(path, body: bodies[0], context: context) else { return }
@@ -160,13 +161,23 @@ private func flashLights(_ colors: TeamColors, context: LambdaContext) async thr
             }
         }
     }
+
+    // Let the last color hold for a full step, then put every light back the way it was
+    try await clock.sleep(until: start + flashInterval * flashColorChanges)
+    try await withThrowingDiscardingTaskGroup { group in
+        for state in previousStates {
+            group.addTask {
+                await hue.restore(state, transition: flashTransition, context: context)
+            }
+        }
+    }
 }
 
 struct HueClient: Sendable {
     let applicationKey: String
     let accessToken: String
 
-    func groupedLightId(forZoneNamed name: String, context: LambdaContext) async -> String? {
+    func zone(named name: String, context: LambdaContext) async -> GameDayZone? {
         guard let zones = await get("zone", as: ResourceList<Zone>.self, context: context) else { return nil }
         guard let zone = zones.data.first(where: { $0.metadata.name == name }) else {
             context.logger.error("No Hue zone named \(name) found")
@@ -176,7 +187,32 @@ struct HueClient: Sendable {
             context.logger.error("Hue zone \(name) has no grouped_light service")
             return nil
         }
-        return groupedLight.rid
+        let lightIds = zone.children.filter { $0.rtype == "light" }.map(\.rid)
+        return GameDayZone(groupedLightId: groupedLight.rid, lightIds: lightIds)
+    }
+
+    // A snapshot of each light in the zone, taken so the flash can be undone
+    func lightStates(in zone: GameDayZone, context: LambdaContext) async -> [LightState] {
+        guard let lights = await get("light", as: ResourceList<Light>.self, context: context) else { return [] }
+        let states = lights.data.filter { zone.lightIds.contains($0.id) }.map(LightState.init)
+        context.logger.info("Captured state of \(states.count) lights: \(states)")
+        return states
+    }
+
+    func restore(_ state: LightState, transition: Duration, context: LambdaContext) async {
+        let encoder = JSONEncoder()
+        let path = "light/\(state.id)"
+        do {
+            // Color and brightness first, while the light is still on from the flash
+            let restoreLook = try encoder.encode(LightUpdate(state: state, transition: transition))
+            guard await put(path, body: restoreLook, context: context) else { return }
+            if !state.on {
+                let turnOff = try encoder.encode(LightUpdate(on: false, transition: transition))
+                _ = await put(path, body: turnOff, context: context)
+            }
+        } catch {
+            context.logger.error("Couldn't encode the restore request for \(path): \(error)")
+        }
     }
 
     func get<Resource: Decodable>(_ path: String, as type: Resource.Type, context: LambdaContext) async -> Resource? {
@@ -231,8 +267,43 @@ struct HueClient: Sendable {
     }
 }
 
+struct GameDayZone: Sendable {
+    let groupedLightId: String
+    let lightIds: [String]
+}
+
+// What a light was doing before the flash. Color lights report both xy and mirek; mirek is only the live
+// value when the light is in color temperature mode, so that is the one to restore in that case.
+struct LightState: Sendable {
+    let id: String
+    let on: Bool
+    let brightness: Double?
+    let xy: XYColor?
+    let mirek: Int?
+
+    init(_ light: Light) {
+        id = light.id
+        on = light.on.on
+        brightness = light.dimming?.brightness
+        if let colorTemperature = light.colorTemperature, colorTemperature.mirekValid, let mirek = colorTemperature.mirek {
+            self.mirek = mirek
+            xy = nil
+        } else {
+            mirek = nil
+            xy = light.color?.xy
+        }
+    }
+}
+
+// MARK: Hue CLIP v2 resources
+
 struct ResourceList<Resource: Decodable>: Decodable {
     let data: [Resource]
+}
+
+struct ResourceReference: Decodable {
+    let rid: String
+    let rtype: String
 }
 
 struct Zone: Decodable {
@@ -240,23 +311,54 @@ struct Zone: Decodable {
         let name: String
     }
 
-    struct Service: Decodable {
-        let rid: String
-        let rtype: String
-    }
-
     let metadata: Metadata
-    let services: [Service]
+    let children: [ResourceReference]
+    let services: [ResourceReference]
 }
 
-// Body for PUT /route/clip/v2/resource/grouped_light/{id}
+struct Light: Decodable {
+    struct On: Decodable {
+        let on: Bool
+    }
+
+    struct Dimming: Decodable {
+        let brightness: Double
+    }
+
+    struct Color: Decodable {
+        let xy: XYColor
+    }
+
+    struct ColorTemperature: Decodable {
+        let mirek: Int?
+        let mirekValid: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case mirek
+            case mirekValid = "mirek_valid"
+        }
+    }
+
+    let id: String
+    let on: On
+    let dimming: Dimming?
+    let color: Color?
+    let colorTemperature: ColorTemperature?
+
+    enum CodingKeys: String, CodingKey {
+        case id, on, dimming, color
+        case colorTemperature = "color_temperature"
+    }
+}
+
+// Body for PUT /route/clip/v2/resource/grouped_light/{id}. `color` is left out when the step only changes brightness.
 struct GroupedLightUpdate: Encodable {
     struct On: Encodable {
         let on = true
     }
 
     struct Dimming: Encodable {
-        let brightness = 100.0
+        let brightness: Double
     }
 
     struct Color: Encodable {
@@ -268,31 +370,59 @@ struct GroupedLightUpdate: Encodable {
     }
 
     let on = On()
-    let dimming = Dimming()
-    let color: Color
+    let dimming: Dimming
+    let color: Color?
     let dynamics: Dynamics
 
-    init(color: XYColor, transition: Duration) {
-        self.color = Color(xy: color)
+    init(color: LightColor, transition: Duration) {
+        dimming = Dimming(brightness: color.brightness)
+        self.color = color.xy.map(Color.init)
         dynamics = Dynamics(duration: Int(transition / .milliseconds(1)))
     }
 }
 
-struct TeamColors: Sendable {
-    let primary: XYColor
-    let secondary: XYColor
+// Body for PUT /route/clip/v2/resource/light/{id}. Only the fields that are set are sent.
+struct LightUpdate: Encodable {
+    struct On: Encodable {
+        let on: Bool
+    }
 
-    static let tulsa = TeamColors(primary: .gold, secondary: .blue)
-    static let eagles = TeamColors(primary: .midnightGreen, secondary: .silver)
-}
+    struct Dimming: Encodable {
+        let brightness: Double
+    }
 
-// CIE xy as reported by the bridge for the hue/sat values these colors were originally tuned with
-struct XYColor: Encodable, Sendable {
-    let x: Double
-    let y: Double
+    struct Color: Encodable {
+        let xy: XYColor
+    }
 
-    static let gold = XYColor(x: 0.4263, y: 0.4203)
-    static let blue = XYColor(x: 0.1541, y: 0.081)
-    static let midnightGreen = XYColor(x: 0.1637, y: 0.4554)
-    static let silver = XYColor(x: 0.3718, y: 0.3757)
+    struct ColorTemperature: Encodable {
+        let mirek: Int
+    }
+
+    struct Dynamics: Encodable {
+        let duration: Int
+    }
+
+    var on: On?
+    var dimming: Dimming?
+    var color: Color?
+    var colorTemperature: ColorTemperature?
+    let dynamics: Dynamics
+
+    enum CodingKeys: String, CodingKey {
+        case on, dimming, color, dynamics
+        case colorTemperature = "color_temperature"
+    }
+
+    init(state: LightState, transition: Duration) {
+        dimming = state.brightness.map(Dimming.init)
+        color = state.xy.map(Color.init)
+        colorTemperature = state.mirek.map(ColorTemperature.init)
+        dynamics = Dynamics(duration: Int(transition / .milliseconds(1)))
+    }
+
+    init(on: Bool, transition: Duration) {
+        self.on = On(on: on)
+        dynamics = Dynamics(duration: Int(transition / .milliseconds(1)))
+    }
 }

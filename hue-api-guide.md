@@ -86,19 +86,22 @@ Common `PUT /light/<id>` and `PUT /grouped_light/<id>` fields:
 `ScoreProcessor` flashes the zone named **Game Day**. On each trigger it:
 
 1. Reads `hue-remote-username` and `hue-access-token` from SSM.
-2. `GET /route/clip/v2/resource/zone`, finds the zone by name, takes its `grouped_light` service rid.
-3. Every 800 ms for 10 steps, `PUT /route/clip/v2/resource/grouped_light/<rid>` alternating the team's two colors with a 400 ms fade. The first PUT is awaited on its own, so an expired token or unreachable zone fails once and stops the flash. The remaining nine run as child tasks started at fixed deadlines (`ContinuousClock.sleep(until:)`), so a slow response neither delays the next step nor bunches up the rest. A `207` counts as applied since the other lights still change.
+2. `GET /route/clip/v2/resource/zone`, finds the zone by name, takes its `grouped_light` service rid and its `children` light rids.
+3. `GET /route/clip/v2/resource/light` and keeps a snapshot of each zone light: `on.on`, `dimming.brightness`, and either `color_temperature.mirek` (when `mirek_valid`) or `color.xy`.
+4. Every 800 ms for 10 steps, `PUT /route/clip/v2/resource/grouped_light/<rid>` alternating the team's two colors with a 400 ms fade. The first PUT is awaited on its own, so an expired token or unreachable zone fails once and stops the flash. The remaining nine run as child tasks started at fixed deadlines (`ContinuousClock.sleep(until:)`), so a slow response neither delays the next step nor bunches up the rest. A `207` counts as applied since the other lights still change.
+5. One step after the last change, `PUT /route/clip/v2/resource/light/<id>` for each light in parallel with its saved brightness and xy or mirek (400 ms fade). A light that was off gets a second PUT with `{"on": {"on": false}}` after that, so it comes back on later in its old color rather than the last flash color.
 
 To change which lights flash, edit the Game Day zone in the Hue app (Settings > Rooms & zones). No code change. If the zone is deleted or renamed, the Lambda logs `No Hue zone named Game Day found` and does nothing.
 
-Team colors (xy, derived from the original v1 hue/sat values):
+Teams and their colors live in `Sources/Models/Teams.swift`. Colors are xy plus a brightness percent (derived from the original v1 hue/sat values):
 
-| Color | xy | v1 origin |
-|-------|----|-----------|
-| Tulsa gold | 0.4263, 0.4203 | hue 10500, sat 120 |
-| Tulsa blue | 0.1541, 0.081 | hue 46000, sat 254 |
-| Eagles midnight green | 0.1637, 0.4554 | hue 33660, sat 254 |
-| Eagles silver | 0.3718, 0.3757 | hue 37145, sat 10 |
+| Color | xy | Brightness | v1 origin |
+|-------|----|-----------|-----------|
+| Gold (Tulsa, Missouri) | 0.4263, 0.4203 | 100 | hue 10500, sat 120 |
+| Tulsa blue | 0.1541, 0.081 | 100 | hue 46000, sat 254 |
+| Missouri black | none | 0 | none; a light can't emit black, so this is the lowest brightness the light supports (`brightness: 0` means "lowest possible" in CLIP v2, verified). No xy is sent so the fade from gold only dims; sending a color made the fade pass through that color on the way down (verified) |
+| Eagles midnight green | 0.1637, 0.4554 | 100 | hue 33660, sat 254 |
+| Eagles silver | 0.3718, 0.3757 | 100 | hue 37145, sat 10 |
 
 Lights in the zone as of 2026-09-21 (all gamut C, all support `alternating`):
 

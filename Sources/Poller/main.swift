@@ -32,66 +32,27 @@ let runtime = LambdaRuntime { (event: SQSEvent, context: LambdaContext) async th
     }
 
     if isFootballSeason {
-        // Check active NCAA and NFL scores for Tulsa and/or Eagles football games
+        // Check active NCAA and NFL scores for every monitored football team
         try await withThrowingTaskGroup { group in
             group.addTask {
-                context.logger.info("Checking NCAA football scores...")
-                if let ncaaFootballScores = await fetchScores(NCAAGameScoresResponse.self, from: ncaaFootballScoresUrl, context: context) {
-                    context.logger.info("Received scores for \(ncaaFootballScores.games.count) cfb games")
-                    if let tulsaFootballGame = getTulsaGameFromAPI(ncaaScores: ncaaFootballScores) {
-                        context.logger.info("Found Tulsa football game: \(tulsaFootballGame.title)")
-                        try await writeNCAAGameStatusToDynamoDB(tulsaGame: tulsaFootballGame, sport: .cfb, context: context)
-                    } else {
-                        context.logger.info("Tulsa FB is not playing right now")
-                    }
-                }
+                try await pollNCAAScores(sport: .cfb, url: ncaaFootballScoresUrl, context: context)
             }
-
             group.addTask {
-                context.logger.info("Checking NFL football scores...")
-                if let nflScores = await fetchScores(NFLGameScoresResponse.self, from: nflScoresUrl, context: context) {
-                    context.logger.info("Received scores for \(nflScores.events.count) nfl games")
-                    if let eaglesGame = getEaglesGameFromAPI(nflScores: nflScores) {
-                        context.logger.info("Found Eagles game: \(eaglesGame.shortName)")
-                        try await writeNFLGameStatusToDynamoDB(eaglesGame: eaglesGame, context: context)
-                    } else {
-                        context.logger.info("The Eagles are not playing right now")
-                    }
-                }
+                try await pollNFLScores(url: nflScoresUrl, context: context)
             }
-
             try await group.waitForAll()
         }
     }
 
     if isBasketballSeason {
-        // Check active NCAA scores for Tulsa men's & women's basketball games
+        // Check active NCAA scores for every monitored men's and women's basketball team
         try await withThrowingTaskGroup { group in
             group.addTask {
-                context.logger.info("Checking NCAA basketball scores...")
-                if let mensBasketballScores = await fetchScores(NCAAGameScoresResponse.self, from: mensBasketballScoresUrl, context: context) {
-                    context.logger.info("Received scores for \(mensBasketballScores.games.count) mbb games")
-                    if let tulsaMbbGame = getTulsaGameFromAPI(ncaaScores: mensBasketballScores) {
-                        context.logger.info("Found Tulsa men's basketball game: \(tulsaMbbGame.title)")
-                        try await writeNCAAGameStatusToDynamoDB(tulsaGame: tulsaMbbGame, sport: .mbb, context: context)
-                    } else {
-                        context.logger.info("Tulsa MBB is not playing right now")
-                    }
-                }
+                try await pollNCAAScores(sport: .mbb, url: mensBasketballScoresUrl, context: context)
             }
-
             group.addTask {
-                if let womensBasketballScores = await fetchScores(NCAAGameScoresResponse.self, from: womensBasketballScoresUrl, context: context) {
-                    context.logger.info("Received scores for \(womensBasketballScores.games.count) wbb games")
-                    if let tulsaWbbGame = getTulsaGameFromAPI(ncaaScores: womensBasketballScores) {
-                        context.logger.info("Found Tulsa women's basketball game: \(tulsaWbbGame.title)")
-                        try await writeNCAAGameStatusToDynamoDB(tulsaGame: tulsaWbbGame, sport: .wbb, context: context)
-                    } else {
-                        context.logger.info("Tulsa WBB is not playing right now")
-                    }
-                }
+                try await pollNCAAScores(sport: .wbb, url: womensBasketballScoresUrl, context: context)
             }
-
             try await group.waitForAll()
         }
     }
@@ -104,6 +65,53 @@ try await awsClient.shutdown()
 
 
 // MARK: Poller Utilities
+
+private func pollNCAAScores(sport: Sport, url: String, context: LambdaContext) async throws {
+    let teams = MonitoredTeam.monitoring(sport)
+    guard !teams.isEmpty else { return }
+
+    context.logger.info("Checking NCAA \(sport.rawValue) scores...")
+    guard let scores = await fetchScores(NCAAGameScoresResponse.self, from: url, context: context) else { return }
+    context.logger.info("Received scores for \(scores.games.count) \(sport.rawValue) games")
+
+    // If two monitored teams play each other, the first listed claims the game
+    var claimedGameIds: Set<String> = []
+    for team in teams {
+        guard let game = scores.games.map(\.game).first(where: { $0.home.names.short == team.name || $0.away.names.short == team.name }) else {
+            context.logger.info("\(team.name) \(sport.rawValue) is not playing right now")
+            continue
+        }
+        guard claimedGameIds.insert(game.gameID).inserted else {
+            context.logger.info("\(team.name) \(sport.rawValue) game \(game.title) is already tracked for the other team in it")
+            continue
+        }
+        context.logger.info("Found \(team.name) \(sport.rawValue) game: \(game.title)")
+        try await writeNCAAGameStatusToDynamoDB(game: game, team: team, sport: sport, context: context)
+    }
+}
+
+private func pollNFLScores(url: String, context: LambdaContext) async throws {
+    let teams = MonitoredTeam.monitoring(.nfl)
+    guard !teams.isEmpty else { return }
+
+    context.logger.info("Checking NFL scores...")
+    guard let scores = await fetchScores(NFLGameScoresResponse.self, from: url, context: context) else { return }
+    context.logger.info("Received scores for \(scores.events.count) nfl games")
+
+    var claimedGameIds: Set<String> = []
+    for team in teams {
+        guard let event = scores.events.first(where: { $0.competitions.first?.competitors.contains { $0.team.name == team.name } ?? false }) else {
+            context.logger.info("The \(team.name) are not playing right now")
+            continue
+        }
+        guard claimedGameIds.insert(event.id).inserted else {
+            context.logger.info("\(team.name) game \(event.shortName) is already tracked for the other team in it")
+            continue
+        }
+        context.logger.info("Found \(team.name) game: \(event.shortName)")
+        try await writeNFLGameStatusToDynamoDB(event: event, team: team, context: context)
+    }
+}
 
 private func fetchScores<Response: Decodable>(_ type: Response.Type, from url: String, context: LambdaContext) async -> Response? {
     var request = HTTPClientRequest(url: url)
@@ -128,104 +136,47 @@ private func fetchScores<Response: Decodable>(_ type: Response.Type, from url: S
     }
 }
 
-private func getTulsaGameFromAPI(ncaaScores: NCAAGameScoresResponse) -> Game? {
-    ncaaScores.games.first(where: { $0.game.title.contains("Tulsa") })?.game
-}
-
-private func getEaglesGameFromAPI(nflScores: NFLGameScoresResponse) -> Event? {
-    nflScores.events.first(where: { $0.name.contains("Eagles") })
-}
-
-private func writeNCAAGameStatusToDynamoDB(tulsaGame: Game, sport: Sport, context: LambdaContext) async throws {
-    guard let scoresTableName = Cloud.env("DYNAMODB_SCORES_NAME") else {
-        context.logger.error("DYNAMODB_SCORES_NAME environment variable not set")
-        return
-    }
-
-    let homeTeam = tulsaGame.home.names.short
-
-    var tulsaScore = "0"
-    var opposingTeamScore = "0"
-    var opposingTeam = ""
-    if homeTeam == "Tulsa" {
-        tulsaScore = tulsaGame.home.score
-        opposingTeamScore = tulsaGame.away.score
-        opposingTeam = tulsaGame.away.names.short
-    } else {
-        tulsaScore = tulsaGame.away.score
-        opposingTeamScore = tulsaGame.home.score
-        opposingTeam = tulsaGame.home.names.short
-    }
+private func writeNCAAGameStatusToDynamoDB(game: Game, team: MonitoredTeam, sport: Sport, context: LambdaContext) async throws {
+    let isHome = game.home.names.short == team.name
+    let mine = isHome ? game.home : game.away
+    let opponent = isHome ? game.away : game.home
 
     let gameItem = GameItem(
-        gameId: tulsaGame.gameID,
+        gameId: game.gameID,
         sport: sport.rawValue,
-        myTeam: "Tulsa",
-        myTeamScore: Int(tulsaScore) ?? 0,
-        opposingTeam: opposingTeam,
-        opposingTeamScore: Int(opposingTeamScore) ?? 0,
-        gamePeriod: tulsaGame.currentPeriod
+        myTeam: team.name,
+        myTeamScore: Int(mine.score) ?? 0,
+        opposingTeam: opponent.names.short,
+        opposingTeamScore: Int(opponent.score) ?? 0,
+        gamePeriod: game.currentPeriod
     )
     context.logger.info("NCAA GameItem created as \(gameItem)")
-
-    let dynamoItem: [String: DynamoDB.AttributeValue] = [
-        "gameId": .s(gameItem.gameId),
-        "sport": .s(gameItem.sport),
-        "myTeam": .s(gameItem.myTeam),
-        "myTeamScore": .n(String(gameItem.myTeamScore)),
-        "opposingTeam": .s(gameItem.opposingTeam),
-        "opposingTeamScore": .n(String(gameItem.opposingTeamScore)),
-        "gamePeriod": .s(gameItem.gamePeriod)
-    ]
-    context.logger.info("NCAA DynamoItem created as \(dynamoItem)")
-
-    let ddbInput = DynamoDB.PutItemInput(
-        item: dynamoItem,
-        tableName: scoresTableName
-    )
-
-    do {
-        _ = try await dynamodb.putItem(ddbInput)
-        context.logger.info("Successfully wrote game info to DynamoDB")
-    } catch {
-        context.logger.error("Error writing game info to DynamoDB: \(error)")
-    }
+    try await writeGameItemToDynamoDB(gameItem, context: context)
 }
 
-private func writeNFLGameStatusToDynamoDB(eaglesGame: Event, context: LambdaContext) async throws {
-    guard let scoresTableName = Cloud.env("DYNAMODB_SCORES_NAME") else {
-        context.logger.error("DYNAMODB_SCORES_NAME environment variable not set")
-        return
-    }
-
-    let competition = eaglesGame.competitions.first
-    let homeCompetitor = competition?.competitors.first(where: { $0.homeAway == "home" })
-    let awayCompetitor = competition?.competitors.first(where: { $0.homeAway == "away" })
-
-    var eaglesScore = "0"
-    var opposingTeamScore = "0"
-    var opposingTeam = ""
-
-    if homeCompetitor?.team.name == "Eagles" {
-        eaglesScore = homeCompetitor?.score ?? "0"
-        opposingTeamScore = awayCompetitor?.score ?? "0"
-        opposingTeam = awayCompetitor?.team.name ?? ""
-    } else {
-        eaglesScore = awayCompetitor?.score ?? "0"
-        opposingTeamScore = homeCompetitor?.score ?? "0"
-        opposingTeam = homeCompetitor?.team.name ?? ""
-    }
+private func writeNFLGameStatusToDynamoDB(event: Event, team: MonitoredTeam, context: LambdaContext) async throws {
+    let competition = event.competitions.first
+    let mine = competition?.competitors.first(where: { $0.team.name == team.name })
+    let opponent = competition?.competitors.first(where: { $0.team.name != team.name })
 
     let gameItem = GameItem(
-        gameId: eaglesGame.id,
-        sport: "nfl",
-        myTeam: "Eagles",
-        myTeamScore: Int(eaglesScore) ?? 0,
-        opposingTeam: opposingTeam,
-        opposingTeamScore: Int(opposingTeamScore) ?? 0,
+        gameId: event.id,
+        sport: Sport.nfl.rawValue,
+        myTeam: team.name,
+        myTeamScore: Int(mine?.score ?? "") ?? 0,
+        opposingTeam: opponent?.team.name ?? "",
+        opposingTeamScore: Int(opponent?.score ?? "") ?? 0,
         gamePeriod: competition?.status.type.name ?? ""
     )
     context.logger.info("NFL GameItem created as \(gameItem)")
+    try await writeGameItemToDynamoDB(gameItem, context: context)
+}
+
+private func writeGameItemToDynamoDB(_ gameItem: GameItem, context: LambdaContext) async throws {
+    guard let scoresTableName = Cloud.env("DYNAMODB_SCORES_NAME") else {
+        context.logger.error("DYNAMODB_SCORES_NAME environment variable not set")
+        return
+    }
 
     let dynamoItem: [String: DynamoDB.AttributeValue] = [
         "gameId": .s(gameItem.gameId),
@@ -236,7 +187,7 @@ private func writeNFLGameStatusToDynamoDB(eaglesGame: Event, context: LambdaCont
         "opposingTeamScore": .n(String(gameItem.opposingTeamScore)),
         "gamePeriod": .s(gameItem.gamePeriod)
     ]
-    context.logger.info("NFL DynamoItem created as \(dynamoItem)")
+    context.logger.info("DynamoItem created as \(dynamoItem)")
 
     let ddbInput = DynamoDB.PutItemInput(
         item: dynamoItem,
@@ -249,11 +200,4 @@ private func writeNFLGameStatusToDynamoDB(eaglesGame: Event, context: LambdaCont
     } catch {
         context.logger.error("Error writing game info to DynamoDB: \(error)")
     }
-}
-
-enum Sport: String {
-    case cfb = "cfb"
-    case mbb = "mbb"
-    case wbb = "wbb"
-    case nfl = "nfl"
 }
