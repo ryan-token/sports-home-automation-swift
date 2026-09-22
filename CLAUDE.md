@@ -35,7 +35,7 @@ EventBridge (1 min) → Scheduler → SQS (6 messages, 10s delays) → Poller �
 
 1. **Scheduler** - Triggered by EventBridge every minute. Sends 6 SQS messages with 0/10/20/30/40/50 second delays to simulate 10-second polling.
 2. **Poller** - Triggered by SQS. Checks NCAA API (Tulsa football, men's/women's basketball) and ESPN API (Eagles football) via `HTTPClient.shared`. Writes game state to DynamoDB.
-3. **ScoreProcessor** - Triggered by DynamoDB Streams (NEW_AND_OLD_IMAGES). Compares old/new images to detect scoring events and game endings. Flashes Hue lights in team colors on score/win.
+3. **ScoreProcessor** - Triggered by DynamoDB Streams (NEW_AND_OLD_IMAGES). Compares old/new images to detect scoring events and game endings. Flashes the Hue "Game Day" zone in team colors on score/win via the CLIP v2 remote API (one `grouped_light` PUT per color change, scheduled on a fixed clock). See `hue-api-guide.md`.
 4. **HueTokenRefresher** - Separate cron (every 3 days). Refreshes Hue OAuth tokens stored in SSM Parameter Store.
 
 ### Key dependencies
@@ -92,7 +92,8 @@ swift run Infra deploy --stage prod
 
 - **No official AWS SDK.** This project uses Soto instead of `aws-sdk-swift` because `aws-crt-swift` (a C dependency of the official SDK) cannot cross-compile with the Static Linux SDK.
 - **Region is always `us-east-1`.** All AWS resources and Soto clients use `.useast1`.
-- **SSM parameters** store Hue API credentials: `hue-client-id`, `hue-client-secret`, `hue-access-token`, `hue-refresh-token`, `hue-remote-username`. These are sensitive - never hardcode them.
+- **SSM parameters** store Hue API credentials: `hue-client-id`, `hue-client-secret`, `hue-access-token`, `hue-refresh-token`, `hue-remote-username`. These are sensitive - never hardcode or log them.
+- **Hue lights are configured in the Hue app, not in code.** ScoreProcessor looks up the "Game Day" zone by name at runtime; add or remove lights there.
 - **Season guards.** The Scheduler and Poller exit early if it's not football or basketball season (defined in `SharedUtils.swift`).
 - **External API requests must send a `User-Agent`.** ESPN's CDN returns `403 Forbidden` for requests without a recognized HTTP-library User-Agent (AsyncHTTPClient sends none by default). The Poller sends `AsyncHTTPClient`; unknown or spoofed-browser UAs are also blocked.
 - **Decode only what you read.** API response models include just the fields the code consumes so unused upstream sections (e.g. ESPN's `leagues`/`calendar`) can't break decoding.

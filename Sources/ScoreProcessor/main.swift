@@ -14,7 +14,12 @@ import NIOCore
 import SSMUtils
 import SotoSSM
 
-let delayAmount: Double = 0.25
+// The Hue zone whose lights get flashed. Add or remove lights from it in the Hue app; nothing here needs to change.
+let gameDayZoneName = "Game Day"
+
+let flashColorChanges = 10
+let flashInterval: Duration = .milliseconds(800)
+let flashTransition: Duration = .milliseconds(400)
 
 let awsClient = AWSClient()
 let ssm = SSM(client: awsClient, region: .useast1)
@@ -113,236 +118,162 @@ private func flashLightsAppropriateColors(gameInfo: GameInfo, context: LambdaCon
     switch gameInfo.currentGame.myTeam {
     case "Tulsa":
         context.logger.info("Tulsa won or scored! Flashing lights Tulsa colors...")
-        try await flashLightsTulsaColors(context: context)
+        try await flashLights(.tulsa, context: context)
     case "Eagles":
         context.logger.info("Eagles won or scored! Flashing lights Eagles colors...")
-        try await flashLightsEaglesColors(context: context)
+        try await flashLights(.eagles, context: context)
     default:
         context.logger.info("Some other team won or scored? Flashing lights Tulsa colors anyway...")
-        try await flashLightsTulsaColors(context: context)
+        try await flashLights(.tulsa, context: context)
     }
 }
 
-private func flashLightsTulsaColors(context: LambdaContext) async throws {
-    guard let hueRemoteUsername = try await getSSMParameterValue(parameterName: "hue-remote-username", ssm: ssm, context: context) else { return }
+// MARK: Hue
+
+// Each color change is one request to the zone's grouped_light, so the bridge switches every light at once.
+// Steps are scheduled against fixed deadlines rather than after each response, so API latency can't drift the cadence.
+private func flashLights(_ colors: TeamColors, context: LambdaContext) async throws {
+    guard let hueApplicationKey = try await getSSMParameterValue(parameterName: "hue-remote-username", ssm: ssm, context: context) else { return }
     guard let hueAccessToken = try await getSSMParameterValue(parameterName: "hue-access-token", ssm: ssm, context: context) else { return }
+    let hue = HueClient(applicationKey: hueApplicationKey, accessToken: hueAccessToken)
 
-    try await turnLights(.gold, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
+    guard let groupedLightId = await hue.groupedLightId(forZoneNamed: gameDayZoneName, context: context) else { return }
 
-    try await turnLights(.blue, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
+    let encoder = JSONEncoder()
+    let bodies = try [colors.primary, colors.secondary].map { color in
+        try encoder.encode(GroupedLightUpdate(color: color, transition: flashTransition))
+    }
 
-    try await turnLights(.gold, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.blue, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.gold, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.blue, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.gold, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.blue, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.gold, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.blue, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.gold, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.blue, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.gold, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.blue, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.gold, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.blue, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.gold, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.blue, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.gold, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLight(24, color: .blue, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
+    let clock = ContinuousClock()
+    let start = clock.now
+    for step in 0..<flashColorChanges {
+        try await clock.sleep(until: start + flashInterval * step)
+        await hue.put("grouped_light/\(groupedLightId)", body: bodies[step % 2], context: context)
+    }
 }
 
-private func flashLightsEaglesColors(context: LambdaContext) async throws {
-    guard let hueRemoteUsername = try await getSSMParameterValue(parameterName: "hue-remote-username", ssm: ssm, context: context) else { return }
-    guard let hueAccessToken = try await getSSMParameterValue(parameterName: "hue-access-token", ssm: ssm, context: context) else { return }
+struct HueClient: Sendable {
+    let applicationKey: String
+    let accessToken: String
 
-    try await turnLights(.midnightGreen, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
+    func groupedLightId(forZoneNamed name: String, context: LambdaContext) async -> String? {
+        guard let zones = await get("zone", as: ResourceList<Zone>.self, context: context) else { return nil }
+        guard let zone = zones.data.first(where: { $0.metadata.name == name }) else {
+            context.logger.error("No Hue zone named \(name) found")
+            return nil
+        }
+        guard let groupedLight = zone.services.first(where: { $0.rtype == "grouped_light" }) else {
+            context.logger.error("Hue zone \(name) has no grouped_light service")
+            return nil
+        }
+        return groupedLight.rid
+    }
 
-    try await turnLights(.silver, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.midnightGreen, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.silver, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.midnightGreen, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.silver, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.midnightGreen, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.silver, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.midnightGreen, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.silver, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.midnightGreen, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.silver, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.midnightGreen, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.silver, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.midnightGreen, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.silver, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.midnightGreen, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-
-    try await turnLights(.silver, hueUsername: hueRemoteUsername, hueAccessToken: hueAccessToken, context: context)
-    try await Task.sleep(for: .seconds(delayAmount))
-}
-
-private func turnLights(_ color: TeamColor, hueUsername: String, hueAccessToken: String, context: LambdaContext) async throws {
-    try await withThrowingTaskGroup { group in
-        for lightNumber in [1, 3, 4, 16, 24] { // both front room lamps, both big lamp bulbs, and the tv lightstrip
-            group.addTask {
-                try await turnLight(lightNumber, color: color, hueUsername: hueUsername, hueAccessToken: hueAccessToken, context: context)
+    func get<Resource: Decodable>(_ path: String, as type: Resource.Type, context: LambdaContext) async -> Resource? {
+        do {
+            let response = try await HTTPClient.shared.execute(request(.GET, path), timeout: .seconds(30))
+            let body = try await response.body.collect(upTo: 1024 * 1024)
+            guard response.status == .ok else {
+                context.logger.error("GET \(path) failed with status \(response.status): \(String(buffer: body))")
+                return nil
             }
+            return try JSONDecoder().decode(Resource.self, from: Data(body.readableBytesView))
+        } catch {
+            context.logger.error("GET \(path) failed: \(error)")
+            return nil
         }
-
-        try await group.waitForAll()
     }
-}
 
-private func turnLight(_ lightNumber: Int, color: TeamColor, hueUsername: String, hueAccessToken: String, context: LambdaContext) async throws {
-    let hueBody = buildHueBody(for: color)
-    let url = "https://api.meethue.com/bridge/\(hueUsername)/lights/\(lightNumber)/state"
+    func put(_ path: String, body: Data, context: LambdaContext) async {
+        var request = request(.PUT, path)
+        request.headers.add(name: "Content-Type", value: "application/json")
+        request.body = .bytes(ByteBuffer(bytes: body))
 
-    var request = HTTPClientRequest(url: url)
-    request.method = .PUT
-    request.headers.add(name: "Content-Type", value: "application/json; charset=utf-8")
-    request.headers.add(name: "Authorization", value: "Bearer \(hueAccessToken)")
-
-    do {
-        let jsonData = try JSONSerialization.data(withJSONObject: hueBody)
-        var buffer = ByteBuffer()
-        buffer.writeBytes(jsonData)
-        request.body = .bytes(buffer)
-
-        let response = try await HTTPClient.shared.execute(request, timeout: .seconds(30))
-
-        guard (200...299).contains(response.status.code) else {
-            context.logger.error("HTTP request failed with status: \(response.status)")
-            throw HTTPError.badResponse(response.status.code)
+        do {
+            let response = try await HTTPClient.shared.execute(request, timeout: .seconds(30))
+            // 207 means the bridge accepted the request but couldn't reach every light
+            guard response.status == .ok else {
+                let responseBody = try await response.body.collect(upTo: 64 * 1024)
+                context.logger.error("PUT \(path) returned \(response.status): \(String(buffer: responseBody))")
+                return
+            }
+            context.logger.info("PUT \(path) succeeded")
+        } catch {
+            context.logger.error("PUT \(path) failed: \(error)")
         }
+    }
 
-        context.logger.info("Successfully updated light \(lightNumber) state. Status: \(response.status)")
-    } catch {
-        context.logger.error("Error updating light \(lightNumber): \(error)")
-        throw error
+    private func request(_ method: HTTPMethod, _ path: String) -> HTTPClientRequest {
+        var request = HTTPClientRequest(url: "https://api.meethue.com/route/clip/v2/resource/\(path)")
+        request.method = method
+        request.headers.add(name: "Authorization", value: "Bearer \(accessToken)")
+        request.headers.add(name: "hue-application-key", value: applicationKey)
+        return request
     }
 }
 
-private func buildHueBody(for color: TeamColor) -> [String: Any] {
-    var hueBody: [String: Any] = [:]
+struct ResourceList<Resource: Decodable>: Decodable {
+    let data: [Resource]
+}
 
-    switch color {
-        // Tulsa Colors
-    case .gold:
-        hueBody = [
-            "on": true,
-            "hue": 10500,
-            "sat": 120,
-            "bri": 254
-        ]
-    case .blue:
-        hueBody = [
-            "on": true,
-            "hue": 46000,
-            "sat": 254,
-            "bri": 254
-        ]
-    case .red:
-        hueBody = [
-            "on": true,
-            "hue": 65535,
-            "sat": 237,
-            "bri": 254
-        ]
-
-        // Eagles Colors
-    case .midnightGreen:
-        hueBody = [
-            "on": true,
-            "hue": 33660,
-            "sat": 254,
-            "bri": 254
-        ]
-    case .silver:
-        hueBody = [
-            "on": true,
-            "hue": 37145,
-            "sat": 10,
-            "bri": 254
-        ]
+struct Zone: Decodable {
+    struct Metadata: Decodable {
+        let name: String
     }
 
-    return hueBody
+    struct Service: Decodable {
+        let rid: String
+        let rtype: String
+    }
+
+    let metadata: Metadata
+    let services: [Service]
 }
 
-enum TeamColor {
-    // Tulsa
-    case gold, blue, red
+// Body for PUT /route/clip/v2/resource/grouped_light/{id}
+struct GroupedLightUpdate: Encodable {
+    struct On: Encodable {
+        let on = true
+    }
 
-    // Eagles
-    case midnightGreen, silver
+    struct Dimming: Encodable {
+        let brightness = 100.0
+    }
+
+    struct Color: Encodable {
+        let xy: XYColor
+    }
+
+    struct Dynamics: Encodable {
+        let duration: Int
+    }
+
+    let on = On()
+    let dimming = Dimming()
+    let color: Color
+    let dynamics: Dynamics
+
+    init(color: XYColor, transition: Duration) {
+        self.color = Color(xy: color)
+        dynamics = Dynamics(duration: Int(transition / .milliseconds(1)))
+    }
 }
 
-enum HTTPError: Error {
-    case badResponse(UInt)
+struct TeamColors: Sendable {
+    let primary: XYColor
+    let secondary: XYColor
+
+    static let tulsa = TeamColors(primary: .gold, secondary: .blue)
+    static let eagles = TeamColors(primary: .midnightGreen, secondary: .silver)
+}
+
+// CIE xy as reported by the bridge for the hue/sat values these colors were originally tuned with
+struct XYColor: Encodable, Sendable {
+    let x: Double
+    let y: Double
+
+    static let gold = XYColor(x: 0.4263, y: 0.4203)
+    static let blue = XYColor(x: 0.1541, y: 0.081)
+    static let midnightGreen = XYColor(x: 0.1637, y: 0.4554)
+    static let silver = XYColor(x: 0.3718, y: 0.3757)
 }
