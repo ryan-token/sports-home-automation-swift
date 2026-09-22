@@ -79,7 +79,8 @@ Common `PUT /light/<id>` and `PUT /grouped_light/<id>` fields:
 - `dynamics.duration` is the fade time in ms for that change. Verified on lights and grouped lights.
 - `signaling` makes the bridge blink the light by itself: `on_off`, `on_off_color` (one color), or `alternating` (two colors), for `duration` ms (max 65534000, rounded to 1 s). Verified: it works even when the light is off, the light returns to its previous state when the signal ends, the array key is `colors`, and `dynamics` is ignored so the changes snap rather than fade. The cadence is fixed by the bridge. This project tried it and moved to scheduled `color` updates because the snaps looked harsh.
 - Colors are CIE xy. To convert a v1 `hue`/`sat` you like: set it with v1 (`PUT .../lights/<n>/state {"hue":..,"sat":..}`), then `GET /clip/v2/resource/light/<uuid>` and read `color.xy`. That is how the values below were produced.
-- Rate guidance from Hue is roughly 10 light commands/s and 1 group command/s. The remote relay also serializes requests to one bridge at about 100 ms each (observed), so five parallel per-light PUTs arrive over roughly half a second while one grouped_light PUT lands at once.
+- Rate guidance from Hue is roughly 10 light commands/s and 1 group command/s. A group command is a Zigbee broadcast, and the bridge paces those: grouped_light PUTs sent every 800 ms were applied with visible, scattered stutter, while every 1000 ms they were even (verified by eye, twice). The remote relay also serializes requests to one bridge at about 100 ms each (observed), so five parallel per-light PUTs arrive over roughly half a second while one grouped_light PUT lands at once.
+- The CLIP v2 event stream (`/eventstream/clip/v2`) is not available through the remote relay (`404`), so bridge-side timing can only be checked by watching the lights.
 
 ## How this project uses it
 
@@ -88,8 +89,10 @@ Common `PUT /light/<id>` and `PUT /grouped_light/<id>` fields:
 1. Reads `hue-remote-username` and `hue-access-token` from SSM.
 2. `GET /route/clip/v2/resource/zone`, finds the zone by name, takes its `grouped_light` service rid and its `children` light rids.
 3. `GET /route/clip/v2/resource/light` and keeps a snapshot of each zone light: `on.on`, `dimming.brightness`, and either `color_temperature.mirek` (when `mirek_valid`) or `color.xy`.
-4. Every 800 ms for 10 steps, `PUT /route/clip/v2/resource/grouped_light/<rid>` alternating the team's two colors with a 400 ms fade. The first PUT is awaited on its own, so an expired token or unreachable zone fails once and stops the flash. The remaining nine run as child tasks started at fixed deadlines (`ContinuousClock.sleep(until:)`), so a slow response neither delays the next step nor bunches up the rest. A `207` counts as applied since the other lights still change.
+4. Every 1000 ms for 10 steps, `PUT /route/clip/v2/resource/grouped_light/<rid>` alternating the team's two colors with a 400 ms fade. The first PUT is awaited on its own, so an expired token or unreachable zone fails once and stops the flash. The remaining nine run as child tasks started at fixed deadlines (`ContinuousClock.sleep(until:)`), so a slow response neither delays the next step nor bunches up the rest. A `207` counts as applied since the other lights still change.
 5. One step after the last change, `PUT /route/clip/v2/resource/light/<id>` for each light in parallel with its saved brightness and xy or mirek (400 ms fade). A light that was off gets a second PUT with `{"on": {"on": false}}` after that, so it comes back on later in its old color rather than the last flash color.
+
+Known limit: the snapshot is live bridge state, so if two invocations ever overlap (two monitored teams scoring within the same ~10 s), the second would snapshot the first one's flash colors and restore to those. DynamoDB Streams runs one invocation per shard at a time and this table has a single shard, so records are processed one after another today; this only becomes possible if the table ever splits into multiple shards.
 
 To change which lights flash, edit the Game Day zone in the Hue app (Settings > Rooms & zones). No code change. If the zone is deleted or renamed, the Lambda logs `No Hue zone named Game Day found` and does nothing.
 

@@ -18,7 +18,9 @@ import SotoSSM
 let gameDayZoneName = "Game Day"
 
 let flashColorChanges = 10
-let flashInterval: Duration = .milliseconds(800)
+// Each step is a Zigbee broadcast, which the bridge paces to about one per second. Faster than this and the bridge
+// delays steps unevenly (verified: 800 ms visibly stuttered, 1000 ms did not).
+let flashInterval: Duration = .milliseconds(1000)
 let flashTransition: Duration = .milliseconds(400)
 
 let awsClient = AWSClient()
@@ -205,7 +207,8 @@ struct HueClient: Sendable {
         do {
             // Color and brightness first, while the light is still on from the flash
             let restoreLook = try encoder.encode(LightUpdate(state: state, transition: transition))
-            guard await put(path, body: restoreLook, context: context) else { return }
+            _ = await put(path, body: restoreLook, context: context)
+            // Turn off even if that failed, so a light that was off isn't left on in a flash color
             if !state.on {
                 let turnOff = try encoder.encode(LightUpdate(on: false, transition: transition))
                 _ = await put(path, body: turnOff, context: context)
