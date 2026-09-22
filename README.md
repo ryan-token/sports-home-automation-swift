@@ -12,9 +12,9 @@ All infrastructure is defined in `Sources/Infra/Project.swift` and deployed to A
 1. **EventBridge Cron** - triggers the scheduler Lambda every minute
 2. **Scheduler Lambda** - sends 6 SQS messages with staggered 10-second delays
 3. **SQS Queue** - holds the polling trigger messages
-4. **Poller Lambda** - triggered by SQS, polls the [ncaa-api](https://github.com/henrygd/ncaa-api) for Tulsa football/basketball scores and the [public-espn-api](https://github.com/pseudo-r/Public-ESPN-API) for Eagles scores, writes results to DynamoDB
+4. **Poller Lambda** - triggered by SQS, polls the [ncaa-api](https://github.com/henrygd/ncaa-api) for college football/basketball scores and the [public-espn-api](https://github.com/pseudo-r/Public-ESPN-API) for NFL scores for the teams in `Sources/Models/Teams.swift`, writes results to DynamoDB
 5. **DynamoDB Table** - stores current game state with streaming enabled (new + old images)
-6. **ScoreProcessor Lambda** - triggered by DynamoDB Streams, detects scoring events and wins, then flashes Philips Hue lights in the appropriate team colors
+6. **ScoreProcessor Lambda** - triggered by DynamoDB Streams, detects scoring events and wins, then flashes Philips Hue lights in the appropriate team colors and puts them back how they were
 
 **Hue token refresh** (keeps API tokens valid):
 1. **EventBridge Cron** - triggers the token refresher every 3 days

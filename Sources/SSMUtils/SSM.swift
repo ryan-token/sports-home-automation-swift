@@ -17,7 +17,7 @@ public func getSSMParameterValue(parameterName: String, ssm: SSM, context: Lambd
             return nil
         }
 
-        context.logger.info("Retrieved parameter value: \(parameterValue)")
+        context.logger.info("Retrieved parameter \(parameterName)")
         return parameterValue
     } catch {
         context.logger.error("Error fetching parameter \(parameterName): \(error)")
