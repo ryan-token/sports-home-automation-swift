@@ -21,7 +21,7 @@ let runtime = LambdaRuntime { (event: SQSEvent, context: LambdaContext) async th
     context.logger.info("Received SQS event: \(event)")
 
     let ncaaApiHost = "ncaa-api.henrygd.me" // from https://github.com/henrygd/ncaa-api
-    let nflScoresUrl = "http://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+    let nflScoresUrl = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
     let ncaaFootballScoresUrl = "https://\(ncaaApiHost)/scoreboard/football/fbs"
     let mensBasketballScoresUrl = "https://\(ncaaApiHost)/scoreboard/basketball-men/d1"
     let womensBasketballScoresUrl = "https://\(ncaaApiHost)/scoreboard/basketball-women/d1"
@@ -36,8 +36,8 @@ let runtime = LambdaRuntime { (event: SQSEvent, context: LambdaContext) async th
         try await withThrowingTaskGroup { group in
             group.addTask {
                 context.logger.info("Checking NCAA football scores...")
-                let ncaaFootballScores = try await getNCAAScores(url: ncaaFootballScoresUrl, sport: .cfb, context: context)
-                if let ncaaFootballScores {
+                if let ncaaFootballScores = await fetchScores(NCAAGameScoresResponse.self, from: ncaaFootballScoresUrl, context: context) {
+                    context.logger.info("Received scores for \(ncaaFootballScores.games.count) cfb games")
                     if let tulsaFootballGame = getTulsaGameFromAPI(ncaaScores: ncaaFootballScores) {
                         context.logger.info("Found Tulsa football game: \(tulsaFootballGame.title)")
                         try await writeNCAAGameStatusToDynamoDB(tulsaGame: tulsaFootballGame, sport: .cfb, context: context)
@@ -49,9 +49,9 @@ let runtime = LambdaRuntime { (event: SQSEvent, context: LambdaContext) async th
 
             group.addTask {
                 context.logger.info("Checking NFL football scores...")
-                let nflScores = try await getNFLScores(url: nflScoresUrl, context: context)
-                if let nflScores {
-                    if let eaglesGame: Event = getEaglesGameFromAPI(nflScores: nflScores) {
+                if let nflScores = await fetchScores(NFLGameScoresResponse.self, from: nflScoresUrl, context: context) {
+                    context.logger.info("Received scores for \(nflScores.events.count) nfl games")
+                    if let eaglesGame = getEaglesGameFromAPI(nflScores: nflScores) {
                         context.logger.info("Found Eagles game: \(eaglesGame.shortName)")
                         try await writeNFLGameStatusToDynamoDB(eaglesGame: eaglesGame, context: context)
                     } else {
@@ -69,7 +69,8 @@ let runtime = LambdaRuntime { (event: SQSEvent, context: LambdaContext) async th
         try await withThrowingTaskGroup { group in
             group.addTask {
                 context.logger.info("Checking NCAA basketball scores...")
-                if let mensBasketballScores = try await getNCAAScores(url: mensBasketballScoresUrl, sport: .mbb, context: context) {
+                if let mensBasketballScores = await fetchScores(NCAAGameScoresResponse.self, from: mensBasketballScoresUrl, context: context) {
+                    context.logger.info("Received scores for \(mensBasketballScores.games.count) mbb games")
                     if let tulsaMbbGame = getTulsaGameFromAPI(ncaaScores: mensBasketballScores) {
                         context.logger.info("Found Tulsa men's basketball game: \(tulsaMbbGame.title)")
                         try await writeNCAAGameStatusToDynamoDB(tulsaGame: tulsaMbbGame, sport: .mbb, context: context)
@@ -80,7 +81,8 @@ let runtime = LambdaRuntime { (event: SQSEvent, context: LambdaContext) async th
             }
 
             group.addTask {
-                if let womensBasketballScores = try await getNCAAScores(url: womensBasketballScoresUrl, sport: .wbb, context: context) {
+                if let womensBasketballScores = await fetchScores(NCAAGameScoresResponse.self, from: womensBasketballScoresUrl, context: context) {
+                    context.logger.info("Received scores for \(womensBasketballScores.games.count) wbb games")
                     if let tulsaWbbGame = getTulsaGameFromAPI(ncaaScores: womensBasketballScores) {
                         context.logger.info("Found Tulsa women's basketball game: \(tulsaWbbGame.title)")
                         try await writeNCAAGameStatusToDynamoDB(tulsaGame: tulsaWbbGame, sport: .wbb, context: context)
@@ -103,84 +105,35 @@ try await awsClient.shutdown()
 
 // MARK: Poller Utilities
 
-private func getNCAAScores(url: String, sport: Sport, context: LambdaContext) async throws -> NCAAGameScoresResponse? {
-    let httpClient = HTTPClient(eventLoopGroupProvider: .singleton)
-    defer {
-        _ = httpClient.shutdown()
-    }
-
+private func fetchScores<Response: Decodable>(_ type: Response.Type, from url: String, context: LambdaContext) async -> Response? {
     var request = HTTPClientRequest(url: url)
-    request.method = .GET
     request.headers.add(name: "Accept", value: "application/json")
+    // ESPN's CDN returns 403 for requests without a recognized HTTP client User-Agent
+    request.headers.add(name: "User-Agent", value: "AsyncHTTPClient")
 
     do {
         context.logger.info("Making GET request to \(url)")
         let response = try await HTTPClient.shared.execute(request, timeout: .seconds(30))
 
         guard response.status == .ok else {
-            context.logger.error("HTTP request failed with status: \(response.status)")
+            context.logger.error("GET \(url) failed with status: \(response.status)")
             return nil
         }
 
         let body = try await response.body.collect(upTo: 10 * 1024 * 1024) // 10 MB
-
-        // Convert ByteBuffer to Data using readableBytesView
-        let data = Data(body.readableBytesView)
-
-        let decoder = JSONDecoder()
-        context.logger.info("Decoding data into NCAAGameScoresResponse")
-        let scores = try decoder.decode(NCAAGameScoresResponse.self, from: data)
-
-        context.logger.info("Received scores for \(scores.games.count) \(sport) games")
-        return scores
+        return try JSONDecoder().decode(Response.self, from: Data(body.readableBytesView))
     } catch {
-        context.logger.error("Request failed: \(error)")
+        context.logger.error("GET \(url) failed: \(error)")
         return nil
     }
 }
 
 private func getTulsaGameFromAPI(ncaaScores: NCAAGameScoresResponse) -> Game? {
-    return ncaaScores.games.first(where: { $0.game.title.contains("Tulsa") })?.game
-}
-
-private func getNFLScores(url: String, context: LambdaContext) async throws -> NFLGameScoresResponse? {
-    let httpClient = HTTPClient(eventLoopGroupProvider: .singleton)
-    defer {
-        _ = httpClient.shutdown()
-    }
-
-    var request = HTTPClientRequest(url: url)
-    request.method = .GET
-    request.headers.add(name: "Accept", value: "application/json")
-
-    do {
-        context.logger.info("Making GET request to \(url)")
-        let response = try await HTTPClient.shared.execute(request, timeout: .seconds(30))
-
-        guard response.status == .ok else {
-            context.logger.error("HTTP request failed with status: \(response.status)")
-            return nil
-        }
-
-        let body = try await response.body.collect(upTo: 10 * 1024 * 1024) // 10 MB
-
-        // Convert ByteBuffer to Data using readableBytesView
-        let data = Data(body.readableBytesView)
-
-        let decoder = JSONDecoder()
-        context.logger.info("Decoding data into NFLGameScoresResponse")
-        let scores = try decoder.decode(NFLGameScoresResponse.self, from: data)
-
-        context.logger.info("Received scores for \(scores.events.count) nfl games")
-        return scores
-    } catch {
-        context.logger.error("Request failed: \(error)")
-        return nil
-    }
+    ncaaScores.games.first(where: { $0.game.title.contains("Tulsa") })?.game
 }
 
 private func getEaglesGameFromAPI(nflScores: NFLGameScoresResponse) -> Event? {
-    return nflScores.events.first(where: { $0.name.contains("Eagles") })
+    nflScores.events.first(where: { $0.name.contains("Eagles") })
 }
 
 private func writeNCAAGameStatusToDynamoDB(tulsaGame: Game, sport: Sport, context: LambdaContext) async throws {
