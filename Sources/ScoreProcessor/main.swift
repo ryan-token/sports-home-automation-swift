@@ -143,12 +143,22 @@ private func flashLights(_ colors: TeamColors, context: LambdaContext) async thr
     let bodies = try [colors.primary, colors.secondary].map { color in
         try encoder.encode(GroupedLightUpdate(color: color, transition: flashTransition))
     }
+    let path = "grouped_light/\(groupedLightId)"
 
+    // The first change is sent on its own so an expired token or unreachable zone fails once instead of ten times.
+    guard await hue.put(path, body: bodies[0], context: context) else { return }
+
+    // The remaining changes run as child tasks, each started at its deadline, so a slow response
+    // neither delays the next change nor lets the ones after it pile up into a burst.
     let clock = ContinuousClock()
     let start = clock.now
-    for step in 0..<flashColorChanges {
-        try await clock.sleep(until: start + flashInterval * step)
-        await hue.put("grouped_light/\(groupedLightId)", body: bodies[step % 2], context: context)
+    try await withThrowingDiscardingTaskGroup { group in
+        for step in 1..<flashColorChanges {
+            try await clock.sleep(until: start + flashInterval * step)
+            group.addTask {
+                _ = await hue.put(path, body: bodies[step % 2], context: context)
+            }
+        }
     }
 }
 
@@ -184,22 +194,31 @@ struct HueClient: Sendable {
         }
     }
 
-    func put(_ path: String, body: Data, context: LambdaContext) async {
+    // Returns whether the bridge applied the change. 207 means it accepted the request but couldn't reach
+    // every light; the rest still changed, so that counts as applied.
+    func put(_ path: String, body: Data, context: LambdaContext) async -> Bool {
         var request = request(.PUT, path)
         request.headers.add(name: "Content-Type", value: "application/json")
         request.body = .bytes(ByteBuffer(bytes: body))
 
         do {
             let response = try await HTTPClient.shared.execute(request, timeout: .seconds(30))
-            // 207 means the bridge accepted the request but couldn't reach every light
-            guard response.status == .ok else {
+            switch response.status {
+            case .ok:
+                context.logger.info("PUT \(path) succeeded")
+                return true
+            case .multiStatus:
+                let responseBody = try await response.body.collect(upTo: 64 * 1024)
+                context.logger.warning("PUT \(path) returned 207, some lights unreachable: \(String(buffer: responseBody))")
+                return true
+            default:
                 let responseBody = try await response.body.collect(upTo: 64 * 1024)
                 context.logger.error("PUT \(path) returned \(response.status): \(String(buffer: responseBody))")
-                return
+                return false
             }
-            context.logger.info("PUT \(path) succeeded")
         } catch {
             context.logger.error("PUT \(path) failed: \(error)")
+            return false
         }
     }
 

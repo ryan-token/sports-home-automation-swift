@@ -87,7 +87,7 @@ Common `PUT /light/<id>` and `PUT /grouped_light/<id>` fields:
 
 1. Reads `hue-remote-username` and `hue-access-token` from SSM.
 2. `GET /route/clip/v2/resource/zone`, finds the zone by name, takes its `grouped_light` service rid.
-3. Every 800 ms for 10 steps, `PUT /route/clip/v2/resource/grouped_light/<rid>` alternating the team's two colors with a 400 ms fade. Steps are scheduled against fixed deadlines (`ContinuousClock.sleep(until:)`), so the cadence is the same regardless of how long each request takes.
+3. Every 800 ms for 10 steps, `PUT /route/clip/v2/resource/grouped_light/<rid>` alternating the team's two colors with a 400 ms fade. The first PUT is awaited on its own, so an expired token or unreachable zone fails once and stops the flash. The remaining nine run as child tasks started at fixed deadlines (`ContinuousClock.sleep(until:)`), so a slow response neither delays the next step nor bunches up the rest. A `207` counts as applied since the other lights still change.
 
 To change which lights flash, edit the Game Day zone in the Hue app (Settings > Rooms & zones). No code change. If the zone is deleted or renamed, the Lambda logs `No Hue zone named Game Day found` and does nothing.
 
