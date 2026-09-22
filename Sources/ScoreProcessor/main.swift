@@ -148,13 +148,15 @@ private func flashLights(_ colors: TeamColors, context: LambdaContext) async thr
     }
     let path = "grouped_light/\(zone.groupedLightId)"
 
+    // The clock starts before the first request so every step, including the second, is one interval apart.
+    let clock = ContinuousClock()
+    let start = clock.now
+
     // The first change is sent on its own so an expired token or unreachable zone fails once instead of ten times.
     guard await hue.put(path, body: bodies[0], context: context) else { return }
 
     // The remaining changes run as child tasks, each started at its deadline, so a slow response
     // neither delays the next change nor lets the ones after it pile up into a burst.
-    let clock = ContinuousClock()
-    let start = clock.now
     try await withThrowingDiscardingTaskGroup { group in
         for step in 1..<flashColorChanges {
             try await clock.sleep(until: start + flashInterval * step)
