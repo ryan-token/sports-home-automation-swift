@@ -36,7 +36,7 @@ EventBridge (1 min) → Scheduler → SQS (6 messages, 10s delays) → Poller �
 
 1. **Scheduler** - Triggered by EventBridge every minute. Sends 6 SQS messages with 0/10/20/30/40/50 second delays to simulate 10-second polling.
 2. **Poller** - Triggered by SQS. Checks the NCAA API (cfb, mbb, wbb) and ESPN API (nfl) via `HTTPClient.shared` for every team in `MonitoredTeam.all` that follows that sport. Writes game state to DynamoDB.
-3. **ScoreProcessor** - Triggered by DynamoDB Streams (NEW_AND_OLD_IMAGES). Compares old/new images to detect scoring events and game endings. Flashes the Hue "Game Day" zone in team colors on score/win via the CLIP v2 remote API (one `grouped_light` PUT per color change, scheduled on a fixed clock), then restores each light to its pre-flash state. See `hue-api-guide.md`.
+3. **ScoreProcessor** - Triggered by DynamoDB Streams (NEW_AND_OLD_IMAGES). Compares old/new images to detect scoring events and game endings. Flashes the Hue "Game Day" zone in team colors on score/win via the CLIP v2 remote API (one PUT per light per color change, scheduled on a fixed clock), then restores each light to its pre-flash state. See `hue-api-guide.md`.
 4. **HueTokenRefresher** - Separate cron (every 3 days). Refreshes Hue OAuth tokens stored in SSM Parameter Store.
 
 ### Key dependencies

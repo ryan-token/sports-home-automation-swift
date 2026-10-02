@@ -18,9 +18,10 @@ import SotoSSM
 let gameDayZoneName = "Game Day"
 
 let flashColorChanges = 10
-// Each step is a Zigbee broadcast, which the bridge paces to about one per second. Faster than this and the bridge
-// delays steps unevenly (verified: 800 ms visibly stuttered, 1000 ms did not).
-let flashInterval: Duration = .milliseconds(1000)
+// Each step is one PUT per light, which the remote API applies about 100 ms apart, so the change ripples across the
+// lights. 700 ms fits the 5 lights in Game Day; more lights need a longer interval. A grouped_light PUT changes every
+// light at once, but the bridge paces those to about one per second (800 and 900 ms visibly stuttered).
+let flashInterval: Duration = .milliseconds(700)
 let flashTransition: Duration = .milliseconds(400)
 
 let awsClient = AWSClient()
@@ -128,7 +129,7 @@ private func flashLightsAppropriateColors(gameInfo: GameInfo, context: LambdaCon
 
 // MARK: Hue
 
-// Each color change is one request to the zone's grouped_light, so the bridge switches every light at once.
+// Each color change is sent to every light in the zone together.
 // Steps are scheduled against fixed deadlines rather than after each response, so API latency can't drift the cadence.
 // The lights are put back to whatever they were doing before the flash once it ends.
 private func flashLights(_ colors: TeamColors, context: LambdaContext) async throws {
@@ -144,16 +145,15 @@ private func flashLights(_ colors: TeamColors, context: LambdaContext) async thr
 
     let encoder = JSONEncoder()
     let bodies = try [colors.primary, colors.secondary].map { color in
-        try encoder.encode(GroupedLightUpdate(color: color, transition: flashTransition))
+        try encoder.encode(FlashUpdate(color: color, transition: flashTransition))
     }
-    let path = "grouped_light/\(zone.groupedLightId)"
 
     // The clock starts before the first request so every step, including the second, is one interval apart.
     let clock = ContinuousClock()
     let start = clock.now
 
-    // The first change is sent on its own so an expired token or unreachable zone fails once instead of ten times.
-    guard await hue.put(path, body: bodies[0], context: context) else { return }
+    // The first change is sent on its own so an expired token or unreachable bridge fails once instead of ten times.
+    guard await hue.putEach(zone.lightIds, body: bodies[0], context: context) else { return }
 
     // The remaining changes run as child tasks, each started at its deadline, so a slow response
     // neither delays the next change nor lets the ones after it pile up into a burst.
@@ -161,7 +161,7 @@ private func flashLights(_ colors: TeamColors, context: LambdaContext) async thr
         for step in 1..<flashColorChanges {
             try await clock.sleep(until: start + flashInterval * step)
             group.addTask {
-                _ = await hue.put(path, body: bodies[step % 2], context: context)
+                _ = await hue.putEach(zone.lightIds, body: bodies[step % 2], context: context)
             }
         }
     }
@@ -187,12 +187,12 @@ struct HueClient: Sendable {
             context.logger.error("No Hue zone named \(name) found")
             return nil
         }
-        guard let groupedLight = zone.services.first(where: { $0.rtype == "grouped_light" }) else {
-            context.logger.error("Hue zone \(name) has no grouped_light service")
+        let lightIds = zone.children.filter { $0.rtype == "light" }.map(\.rid)
+        guard !lightIds.isEmpty else {
+            context.logger.error("Hue zone \(name) has no lights")
             return nil
         }
-        let lightIds = zone.children.filter { $0.rtype == "light" }.map(\.rid)
-        return GameDayZone(groupedLightId: groupedLight.rid, lightIds: lightIds)
+        return GameDayZone(lightIds: lightIds)
     }
 
     // A snapshot of each light in the zone, taken so the flash can be undone
@@ -235,8 +235,19 @@ struct HueClient: Sendable {
         }
     }
 
-    // Returns whether the bridge applied the change. 207 means it accepted the request but couldn't reach
-    // every light; the rest still changed, so that counts as applied.
+    // Sends the same change to every light in parallel. Returns whether any light accepted it, so an expired token
+    // stops the flash but one bad light doesn't.
+    func putEach(_ lightIds: [String], body: Data, context: LambdaContext) async -> Bool {
+        await withTaskGroup { group in
+            for id in lightIds {
+                group.addTask { await put("light/\(id)", body: body, context: context) }
+            }
+            return await group.contains(true)
+        }
+    }
+
+    // Returns whether the bridge accepted the change. 207 means it did but couldn't reach the light over Zigbee,
+    // which is a problem with that light rather than the request, so it counts as accepted.
     func put(_ path: String, body: Data, context: LambdaContext) async -> Bool {
         var request = request(.PUT, path)
         request.headers.add(name: "Content-Type", value: "application/json")
@@ -273,7 +284,6 @@ struct HueClient: Sendable {
 }
 
 struct GameDayZone: Sendable {
-    let groupedLightId: String
     let lightIds: [String]
 }
 
@@ -318,7 +328,6 @@ struct Zone: Decodable {
 
     let metadata: Metadata
     let children: [ResourceReference]
-    let services: [ResourceReference]
 }
 
 struct Light: Decodable {
@@ -356,8 +365,8 @@ struct Light: Decodable {
     }
 }
 
-// Body for PUT /route/clip/v2/resource/grouped_light/{id}. `color` is left out when the step only changes brightness.
-struct GroupedLightUpdate: Encodable {
+// Body for a flash step's PUT /route/clip/v2/resource/light/{id}. `color` is left out for brightness-only steps.
+struct FlashUpdate: Encodable {
     struct On: Encodable {
         let on = true
     }

@@ -1,6 +1,6 @@
 # Hue API Guide
 
-A working reference for how this project talks to the Philips Hue Bridge Pro, and for debugging when it doesn't. Everything marked "verified" was tested against the real bridge through the remote API on 2026-09-21.
+A working reference for how this project talks to the Philips Hue Bridge Pro, and for debugging when it doesn't. Everything marked "verified" was tested against the real bridge through the remote API on 2026-09-21 unless another date is given.
 
 ## Official documentation
 
@@ -79,7 +79,7 @@ Common `PUT /light/<id>` and `PUT /grouped_light/<id>` fields:
 - `dynamics.duration` is the fade time in ms for that change. Verified on lights and grouped lights.
 - `signaling` makes the bridge blink the light by itself: `on_off`, `on_off_color` (one color), or `alternating` (two colors), for `duration` ms (max 65534000, rounded to 1 s). Verified: it works even when the light is off, the light returns to its previous state when the signal ends, the array key is `colors`, and `dynamics` is ignored so the changes snap rather than fade. The cadence is fixed by the bridge. This project tried it and moved to scheduled `color` updates because the snaps looked harsh.
 - Colors are CIE xy. To convert a v1 `hue`/`sat` you like: set it with v1 (`PUT .../lights/<n>/state {"hue":..,"sat":..}`), then `GET /clip/v2/resource/light/<uuid>` and read `color.xy`. That is how the values below were produced.
-- Rate guidance from Hue is roughly 10 light commands/s and 1 group command/s. A group command is a Zigbee broadcast, and the bridge paces those: grouped_light PUTs sent every 800 ms were applied with visible, scattered stutter, while every 1000 ms they were even (verified by eye, twice). The remote relay also serializes requests to one bridge at about 100 ms each (observed), so five parallel per-light PUTs arrive over roughly half a second while one grouped_light PUT lands at once.
+- Rate guidance from Hue is roughly 10 light commands/s and 1 group command/s. A group command is a Zigbee broadcast, and the bridge paces those: grouped_light PUTs sent every 800 ms were applied with visible, scattered stutter, while every 1000 ms they were even (verified by eye, twice). The remote relay also serializes requests to one bridge at about 100 ms each (observed), so five parallel per-light PUTs arrive over roughly half a second while one grouped_light PUT lands at once. Per-light PUTs to 5 lights every 700 ms stayed on an even beat (verified by eye, twice, 2026-10-01); grouped_light at 900 ms still stuttered.
 - The CLIP v2 event stream (`/eventstream/clip/v2`) is not available through the remote relay (`404`), so bridge-side timing can only be checked by watching the lights.
 
 ## How this project uses it
@@ -87,9 +87,9 @@ Common `PUT /light/<id>` and `PUT /grouped_light/<id>` fields:
 `ScoreProcessor` flashes the zone named **Game Day**. On each trigger it:
 
 1. Reads `hue-remote-username` and `hue-access-token` from SSM.
-2. `GET /route/clip/v2/resource/zone`, finds the zone by name, takes its `grouped_light` service rid and its `children` light rids.
+2. `GET /route/clip/v2/resource/zone`, finds the zone by name, and takes its `children` light rids.
 3. `GET /route/clip/v2/resource/light` and keeps a snapshot of each zone light: `on.on`, `dimming.brightness`, and either `color_temperature.mirek` (when `mirek_valid`) or `color.xy`.
-4. Every 1000 ms for 10 steps, `PUT /route/clip/v2/resource/grouped_light/<rid>` alternating the team's two colors with a 400 ms fade. The first PUT is awaited on its own, so an expired token or unreachable zone fails once and stops the flash. The remaining nine run as child tasks started at fixed deadlines (`ContinuousClock.sleep(until:)`), so a slow response neither delays the next step nor bunches up the rest. A `207` counts as applied since the other lights still change.
+4. Every 700 ms for 10 steps, `PUT /route/clip/v2/resource/light/<id>` to every zone light in parallel, alternating the team's two colors with a 400 ms fade. The relay applies the PUTs about 100 ms apart in no fixed order, so each change ripples across the lights. This is on purpose: `grouped_light` changes every light at once but can't go faster than one change per second without stuttering. The first step is awaited on its own, so an expired token fails once and stops the flash. The remaining nine run as child tasks started at fixed deadlines (`ContinuousClock.sleep(until:)`), so a slow response neither delays the next step nor bunches up the rest. A step counts as applied if any light returns `200` or `207`. Each light adds about 100 ms to a step, so a zone of more than about 6 lights needs a longer `flashInterval`.
 5. One step after the last change, `PUT /route/clip/v2/resource/light/<id>` for each light in parallel with its saved brightness and xy or mirek (400 ms fade). A light that was off gets a second PUT with `{"on": {"on": false}}` after that, so it comes back on later in its old color rather than the last flash color.
 
 Known limit: the snapshot is live bridge state, so if two invocations ever overlap (two monitored teams scoring within the same ~10 s), the second would snapshot the first one's flash colors and restore to those. DynamoDB Streams runs one invocation per shard at a time and this table has a single shard, so records are processed one after another today; this only becomes possible if the table ever splits into multiple shards.
@@ -143,10 +143,10 @@ curl -s "${H[@]}" -X PUT $BASE/grouped_light/<rid> -d '{"color":{"xy":{"x":0.426
 | `invalid_client` from `/v2/oauth2/token` | Basic auth header is wrong, or client id/secret in SSM don't match the app in My apps |
 | `207` with `communication_error` | That light is unreachable over Zigbee (switched off at the wall, out of range). Other lights in the group still change |
 | `No Hue zone named Game Day found` | Zone was renamed or deleted in the Hue app |
-| Lights flash but out of sync | Something is PUTting per light instead of to the zone's `grouped_light` |
+| Flash steps run together or lag | The zone has more lights than `flashInterval` allows at about 100 ms per light; lengthen it |
 | Local `https://<bridge-ip>` fails TLS | Expected; the bridge cert is self-signed. Use `curl -k` or pin the cert |
 
-Lambda logs: `/aws/lambda/prod-score-processor-*` in CloudWatch. Every Hue request logs `PUT grouped_light/... succeeded` or the status and error body.
+Lambda logs: `/aws/lambda/prod-score-processor-*` in CloudWatch. Every Hue request logs `PUT light/... succeeded` or the status and error body.
 
 ## Hue Bridge Pro notes
 
@@ -180,7 +180,7 @@ The Bridge Pro speaks the same CLIP v1 and v2 APIs as the v2 square bridge; noth
 
 **Room vs zone**: a room contains devices, and a device can be in only one room. A zone contains light services and a light can be in any number of zones. Both get a `grouped_light`. Zones are the right tool for "these lights, wherever they are", which is why this project uses one.
 
-**`grouped_light`**: the virtual light that stands for all lights in a room or zone. A PUT to it is broadcast to every member at once, which is both faster and better synchronized than PUTting to each light.
+**`grouped_light`**: the virtual light that stands for all lights in a room or zone. A PUT to it is broadcast to every member at once, which is better synchronized than PUTting to each light but limited to about one change per second. This project flashes per light for that reason.
 
 **`xy`**: a color as a point in the CIE 1931 chromaticity diagram, two numbers between 0 and 1. This is how v2 expresses color. It is device-independent, unlike v1's `hue`/`sat` which the bridge interpreted per bulb.
 
