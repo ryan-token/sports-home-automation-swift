@@ -11,7 +11,7 @@ import SotoSSM
 
 public func getSSMParameterValue(parameterName: String, ssm: SSM, context: LambdaContext) async throws -> String? {
     do {
-        let response = try await ssm.getParameter(.init(name: parameterName))
+        let response = try await ssm.getParameter(.init(name: parameterName, withDecryption: true))
         guard let parameterValue = response.parameter?.value else {
             context.logger.error("Parameter value for \(parameterName) is nil")
             return nil
@@ -29,14 +29,14 @@ public func updateSSMParameters(tokenResponse: HueTokenResponse, ssm: SSM) async
     _ = try await ssm.putParameter(.init(
         name: "hue-access-token",
         overwrite: true,
-        type: .string,
+        type: .secureString,
         value: tokenResponse.access_token
     ))
 
     _ = try await ssm.putParameter(.init(
         name: "hue-refresh-token",
         overwrite: true,
-        type: .string,
+        type: .secureString,
         value: tokenResponse.refresh_token
     ))
 }

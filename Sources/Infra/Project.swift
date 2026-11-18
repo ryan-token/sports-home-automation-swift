@@ -11,9 +11,25 @@ import Cloud
 // That EventBridge schedule triggers a scheduler function that fires off 6 SQS messages, one for every 10 seconds (via the delaySeconds SQS input option)
 // Those SQS events trigger the API poller every 10 seconds, which writes relevant games to DynamoDB
 // Those DynamoDB writes get streamed to the processor Lambda which can control my lights if the relevant team wins
+/// The fields of Pulumi's `aws:getCallerIdentity` result that this project reads.
+struct CallerIdentity {
+    let accountId: String
+}
+
 @main
 struct SportsHomeAutomationSwift: AWSProject {
     func build() async throws -> Outputs {
+        // The account being deployed to, resolved by Pulumi at deploy time, so the
+        // SSM permission ARNs below follow whichever AWS profile is active.
+        let accountId = Variable<CallerIdentity>.invoke(
+            name: "caller-identity",
+            function: "aws:getCallerIdentity"
+        ).output.accountId
+
+        func ssmParameterARN(_ name: String) -> String {
+            "arn:aws:ssm:us-east-1:\(accountId):parameter/\(name)"
+        }
+
         // MARK: App Infrastructure
 
         let pollerCron = AWS.Cron(
@@ -66,8 +82,8 @@ struct SportsHomeAutomationSwift: AWSProject {
                 effect: "Allow",
                 actions: ["ssm:GetParameter"],
                 resources: [
-                    "arn:aws:ssm:us-east-1:725350831613:parameter/hue-remote-username",
-                    "arn:aws:ssm:us-east-1:725350831613:parameter/hue-access-token"
+                    ssmParameterARN("hue-remote-username"),
+                    ssmParameterARN("hue-access-token")
                 ],
                 properties: nil
             )
@@ -96,10 +112,10 @@ struct SportsHomeAutomationSwift: AWSProject {
                 effect: "Allow",
                 actions: ["ssm:GetParameter", "ssm:PutParameter"],
                 resources: [
-                    "arn:aws:ssm:us-east-1:725350831613:parameter/hue-client-id",
-                    "arn:aws:ssm:us-east-1:725350831613:parameter/hue-client-secret",
-                    "arn:aws:ssm:us-east-1:725350831613:parameter/hue-access-token",
-                    "arn:aws:ssm:us-east-1:725350831613:parameter/hue-refresh-token"
+                    ssmParameterARN("hue-client-id"),
+                    ssmParameterARN("hue-client-secret"),
+                    ssmParameterARN("hue-access-token"),
+                    ssmParameterARN("hue-refresh-token")
                 ],
                 properties: nil
             )

@@ -81,19 +81,25 @@ SSMUtils functions accept an `SSM` client parameter so callers control the lifec
 
 ### Toolchain requirements
 
-Deployment requires the **swift.org open-source toolchain** (installed via [Swiftly](https://swiftly.dev/)), NOT the Xcode-bundled Apple toolchain. The Static Linux SDK is only compatible with the swift.org build. The SDK version must exactly match the toolchain version.
+Deployment requires the **swift.org open-source toolchain** (installed via [Swiftly](https://swiftly.dev/)), NOT the Xcode-bundled Apple toolchain. The Static Linux SDK is only compatible with the swift.org build. The SDK version must exactly match the toolchain version (`.swift-version` pins it). Keep only one Static Linux SDK installed: Swift Cloud selects it by triple (`aarch64-swift-linux-musl`), and SwiftPM refuses to build when more than one SDK matches.
+
+### AWS account and credentials
+
+The project deploys to the dedicated `sports-home-automation` AWS account through IAM Identity Center. `.envrc` (direnv) sets `AWS_PROFILE=sports-home-automation` and exports that profile's short-lived SSO credentials, because Soto's SSO provider ignores `AWS_PROFILE` and would otherwise make Swift Cloud read and write its state in the `[default]` account. Sign in with `aws sso login --sso-session ryantoken`, then `direnv reload`. Never put AWS keys in `.env`: Swift Cloud loads it and lets it override the environment. Pulumi state lives in that account's `swift-cloud-assets-<account-id>` bucket; `.cloud/` holds only a local copy.
 
 ### Deploy command
 
 ```bash
-swift run Infra deploy --stage prod
+scripts/deploy.sh prod
 ```
+
+Run it in a real terminal; Swift Cloud's progress UI crashes when the terminal width is 0. The script also links `.build/aarch64-swift-linux-musl/release` to the Swift Build output folder, because Swift Cloud packages Lambdas from the old native-build path and would otherwise upload stale binaries. Don't run `swift run Infra deploy` directly.
 
 ## Important conventions
 
 - **No official AWS SDK.** This project uses Soto instead of `aws-sdk-swift` because `aws-crt-swift` (a C dependency of the official SDK) cannot cross-compile with the Static Linux SDK.
 - **Region is always `us-east-1`.** All AWS resources and Soto clients use `.useast1`.
-- **SSM parameters** store Hue API credentials: `hue-client-id`, `hue-client-secret`, `hue-access-token`, `hue-refresh-token`, `hue-remote-username`. These are sensitive - never hardcode or log them.
+- **SSM parameters** store Hue API credentials as `SecureString`s: `hue-client-id`, `hue-client-secret`, `hue-access-token`, `hue-refresh-token`, `hue-remote-username`. Read them with `withDecryption: true` and write them with `type: .secureString`. These are sensitive - never hardcode or log them.
 - **Teams are configured in `Sources/Models/Teams.swift`.** `MonitoredTeam.all` lists each team's API name, sports, and light colors; the Poller and ScoreProcessor both read it. Team names are matched exactly against `names.short` (NCAA) or `team.name` (ESPN), never by substring (the FBS scoreboard has both "Missouri" and "Missouri St.").
 - **Hue lights are configured in the Hue app, not in code.** ScoreProcessor looks up the "Game Day" zone by name at runtime; add or remove lights there.
 - **Season guards.** The Scheduler and Poller exit early if it's not football or basketball season (defined in `SharedUtils.swift`).
