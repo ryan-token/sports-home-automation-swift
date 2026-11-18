@@ -14,6 +14,7 @@ This is a Swift on Server project that uses [Swift Cloud](https://github.com/swi
 ```
 Sources/
   Infra/Project.swift          # AWS infrastructure definition (Swift Cloud)
+  Infra/Monitoring.swift       # CloudWatch alarms (emailed via SNS) and the sports-home-automation dashboard
   Scheduler/main.swift          # Lambda: sends 6 staggered SQS messages per minute
   Poller/main.swift             # Lambda: polls sports APIs, writes to DynamoDB
   ScoreProcessor/main.swift     # Lambda: processes DynamoDB streams, controls Hue lights
@@ -100,6 +101,7 @@ Run it in a real terminal; Swift Cloud's progress UI crashes when the terminal w
 - **No official AWS SDK.** This project uses Soto instead of `aws-sdk-swift` because `aws-crt-swift` (a C dependency of the official SDK) cannot cross-compile with the Static Linux SDK.
 - **Region is always `us-east-1`.** All AWS resources and Soto clients use `.useast1`.
 - **SSM parameters** store Hue API credentials as `SecureString`s: `hue-client-id`, `hue-client-secret`, `hue-access-token`, `hue-refresh-token`, `hue-remote-username`. Read them with `withDecryption: true` and write them with `type: .secureString`. These are sensitive - never hardcode or log them.
+- **Monitoring reads log levels.** Handlers log failures instead of throwing, so `Infra/Monitoring.swift` counts `error`/`warning` lines with metric filters and alarms on those. Log a real failure at `.error` (it can page) and a degraded-but-working result at `.warning`. The alert address is the `/sports-home-automation/alert-email` SSM parameter, never the repo.
 - **Teams are configured in `Sources/Models/Teams.swift`.** `MonitoredTeam.all` lists each team's API name, sports, and light colors; the Poller and ScoreProcessor both read it. Team names are matched exactly against `names.short` (NCAA) or `team.name` (ESPN), never by substring (the FBS scoreboard has both "Missouri" and "Missouri St.").
 - **Hue lights are configured in the Hue app, not in code.** ScoreProcessor looks up the "Game Day" zone by name at runtime; add or remove lights there.
 - **Season guards.** The Scheduler and Poller exit early if it's not football or basketball season (defined in `SharedUtils.swift`).

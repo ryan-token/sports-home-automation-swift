@@ -121,6 +121,14 @@ struct SportsHomeAutomationSwift: AWSProject {
             )
         )
 
+        addMonitoring(
+            scheduler: sportsApiScheduler,
+            poller: sportsApiPoller,
+            pollerQueue: sportsApiPollerQueue,
+            scoreProcessor: scoreProcessor,
+            tokenRefresher: hueTokenRefresherFunction
+        )
+
         return Outputs([
             "poller-cron-job-name": pollerCron.name,
             "sports-api-scheduler-function-name": sportsApiScheduler.name,
