@@ -14,8 +14,15 @@ import Models
 import SharedUtils
 import SotoDynamoDB
 
+// Time budget, inside the poller's 15-second Lambda timeout (Project.swift): every scoreboard is fetched in
+// parallel within `scoresRequestTimeout`, then each write gets `dynamoDBTimeout`. A hung dependency is logged
+// and counted as a feed error instead of the runtime killing the invocation (a crash that SQS then retries);
+// the next poll is only 10 seconds away anyway.
+let scoresRequestTimeout: Int64 = 6
+let dynamoDBTimeout: Int64 = 3
+
 let awsClient = AWSClient()
-let dynamodb = DynamoDB(client: awsClient, region: .useast1)
+let dynamodb = DynamoDB(client: awsClient, region: .useast1, timeout: .seconds(dynamoDBTimeout))
 
 let runtime = LambdaRuntime { (event: SQSEvent, context: LambdaContext) async throws -> Bool in
     context.logger.info("Received SQS event: \(event)")
@@ -31,29 +38,15 @@ let runtime = LambdaRuntime { (event: SQSEvent, context: LambdaContext) async th
         return false
     }
 
-    if isFootballSeason {
-        // Check active NCAA and NFL scores for every monitored football team
-        try await withThrowingTaskGroup { group in
-            group.addTask {
-                try await pollNCAAScores(sport: .cfb, url: ncaaFootballScoresUrl, context: context)
-            }
-            group.addTask {
-                try await pollNFLScores(url: nflScoresUrl, context: context)
-            }
-            try await group.waitForAll()
+    // Every in-season scoreboard is checked at once, so the slowest one sets the time, not their sum
+    try await withThrowingDiscardingTaskGroup { group in
+        if isFootballSeason {
+            group.addTask { try await pollNCAAScores(sport: .cfb, url: ncaaFootballScoresUrl, context: context) }
+            group.addTask { try await pollNFLScores(url: nflScoresUrl, context: context) }
         }
-    }
-
-    if isBasketballSeason {
-        // Check active NCAA scores for every monitored men's and women's basketball team
-        try await withThrowingTaskGroup { group in
-            group.addTask {
-                try await pollNCAAScores(sport: .mbb, url: mensBasketballScoresUrl, context: context)
-            }
-            group.addTask {
-                try await pollNCAAScores(sport: .wbb, url: womensBasketballScoresUrl, context: context)
-            }
-            try await group.waitForAll()
+        if isBasketballSeason {
+            group.addTask { try await pollNCAAScores(sport: .mbb, url: mensBasketballScoresUrl, context: context) }
+            group.addTask { try await pollNCAAScores(sport: .wbb, url: womensBasketballScoresUrl, context: context) }
         }
     }
 
@@ -121,14 +114,17 @@ private func fetchScores<Response: Decodable>(_ type: Response.Type, from url: S
 
     do {
         context.logger.info("Making GET request to \(url)")
-        let response = try await HTTPClient.shared.execute(request, timeout: .seconds(30))
+        // Bounds the whole exchange, body included (AsyncHTTPClient's own timeout stops at the response head)
+        let (status, body) = try await withTimeout(.seconds(scoresRequestTimeout)) { [request] in
+            let response = try await HTTPClient.shared.execute(request, timeout: .seconds(scoresRequestTimeout))
+            return (response.status, try await response.body.collect(upTo: 10 * 1024 * 1024)) // 10 MB
+        }
 
-        guard response.status == .ok else {
-            context.logger.error("GET \(url) failed with status: \(response.status)")
+        guard status == .ok else {
+            context.logger.error("GET \(url) failed with status: \(status)")
             return nil
         }
 
-        let body = try await response.body.collect(upTo: 10 * 1024 * 1024) // 10 MB
         return try JSONDecoder().decode(Response.self, from: Data(body.readableBytesView))
     } catch {
         context.logger.error("GET \(url) failed: \(error)")

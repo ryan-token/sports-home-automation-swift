@@ -17,7 +17,8 @@ struct SportsApiCronJob: CloudwatchDetail {
 }
 
 let client = AWSClient()
-let sqs = SQS(client: client, region: .useast1)
+// Well inside the 10-second Lambda timeout, so a slow SQS is logged instead of killing the invocation
+let sqs = SQS(client: client, region: .useast1, timeout: .seconds(5))
 
 let runtime = LambdaRuntime { (event: SportsApiCronJob, context: LambdaContext) async throws -> Bool in
     context.logger.info("Received cron event: \(event)")
@@ -32,23 +33,23 @@ let runtime = LambdaRuntime { (event: SportsApiCronJob, context: LambdaContext) 
         return false
     }
 
-    for i in 0..<6 {
-        let input = SQS.SendMessageRequest(
-            delaySeconds: i*10,
-            messageBody: "Check sports scores",
-            queueUrl: queueUrl
-        )
-
-        do {
-            let response = try await sqs.sendMessage(input)
-            context.logger.info("Sent message with delay of \(i * 10) seconds: \(response)")
-        } catch {
-            context.logger.error("Failed to send message: \(error)")
-            return false
-        }
+    // One poll every 10 seconds across the minute, sent in a single batch request
+    let polls = (0..<6).map { index in
+        SQS.SendMessageBatchRequestEntry(delaySeconds: index * 10, id: "poll-\(index)", messageBody: "Check sports scores")
     }
 
-    return true
+    do {
+        let response = try await sqs.sendMessageBatch(.init(entries: polls, queueUrl: queueUrl))
+        let failures = response.failed ?? []
+        for failure in failures {
+            context.logger.error("Failed to queue \(failure.id): \(failure.code) \(failure.message ?? "")")
+        }
+        context.logger.info("Queued \(polls.count - failures.count) of \(polls.count) polls")
+        return failures.isEmpty
+    } catch {
+        context.logger.error("Failed to queue polls: \(error)")
+        return false
+    }
 }
 
 try await runtime.run()

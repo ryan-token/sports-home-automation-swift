@@ -46,9 +46,12 @@ struct SportsHomeAutomationSwift: AWSProject {
 
         let sportsApiPollerQueue = AWS.Queue("sports-api-poller-queue")
 
+        // 15 seconds covers the Poller's own budget (parallel scoreboard fetches, then DynamoDB writes, each
+        // with a shorter timeout) so a slow dependency is logged rather than killing the invocation.
         let sportsApiPoller = AWS.Function(
             "sports-api-poller-function",
             targetName: "Poller",
+            timeout: .seconds(15),
 			build: .staticLinuxSDK,
 			buildOptions: .stripSymbols
         )
@@ -73,7 +76,43 @@ struct SportsHomeAutomationSwift: AWSProject {
         sportsApiScheduler.link(sportsApiPollerQueue) // scheduler Lambda has write permissions to the poller SQS queue
         sportsApiPollerQueue.subscribe(sportsApiPoller) // API poller is invoked by SQS events
         sportsApiPoller.link(scoresTable) // API poller Lambda has write permissions on the 'Scores' DynamoDB table
-        scoresTable.subscribe(scoreProcessor) // 'Scores' DynamoDB table streams NEW_AND_OLD_IMAGES change events to scoreProcessor Lambda
+
+        // 'Scores' DynamoDB table streams NEW_AND_OLD_IMAGES change events to scoreProcessor Lambda.
+        // Written out rather than `scoresTable.subscribe(scoreProcessor)`, which can't cap retries: by default
+        // a record whose flash fails or times out is retried until it ages out of the stream (24 hours),
+        // re-flashing the lights every time and holding back every later score. One retry within two minutes
+        // is plenty; a score older than that isn't worth flashing. It keeps the name `subscribe` gave it, so
+        // the existing mapping is updated in place. Lambda polls the stream with the function's own role, so
+        // reading the stream is the only permission it needs (no table access, no invoke permission).
+        let scoresStreamArn: Output<String> = scoresTable.table.output.keyPath("streamArn")
+        scoreProcessor.link(
+            Link(
+                "scores-stream-read",
+                effect: "Allow",
+                actions: [
+                    "dynamodb:GetRecords",
+                    "dynamodb:GetShardIterator",
+                    "dynamodb:DescribeStream",
+                    "dynamodb:ListStreams"
+                ],
+                resources: [scoresStreamArn],
+                properties: nil
+            )
+        )
+        _ = Resource(
+            name: "\(scoresTable.table.chosenName)-subscription",
+            type: "aws:lambda:EventSourceMapping",
+            properties: [
+                "eventSourceArn": scoresStreamArn,
+                "functionName": scoreProcessor.function.arn,
+                "batchSize": 1,
+                "startingPosition": "LATEST",
+                "maximumRetryAttempts": 1,
+                "maximumRecordAgeInSeconds": 120
+            ],
+            options: scoreProcessor.function.options,
+            context: scoreProcessor.function.context
+        )
 
         // getParameter permissions for hue-remote-username & hue-access-token
         scoreProcessor.link(
@@ -96,9 +135,12 @@ struct SportsHomeAutomationSwift: AWSProject {
             schedule: .rate(.days(3))
         )
 
+        // Runs every 3 days, so it gets a generous budget: three SSM reads, the token request and two writes,
+        // each with its own shorter timeout.
         let hueTokenRefresherFunction = AWS.Function(
             "hue-token-refresher",
             targetName: "HueTokenRefresher",
+            timeout: .seconds(60),
 			build: .staticLinuxSDK,
 			buildOptions: .stripSymbols
         )

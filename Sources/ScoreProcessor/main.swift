@@ -11,6 +11,7 @@ import AWSLambdaRuntime
 import Foundation
 import Models
 import NIOCore
+import SharedUtils
 import SSMUtils
 import SotoSSM
 
@@ -19,13 +20,18 @@ let gameDayZoneName = "Game Day"
 
 let flashColorChanges = 10
 // Each step is one PUT per light, which the remote API applies about 100 ms apart, so the change ripples across the
-// lights. 700 ms fits the 5 lights in Game Day; more lights need a longer interval. A grouped_light PUT changes every
+// lights. 700 ms fits the 6 lights in Game Day (about 600 ms of ripple); more lights need a longer interval. A grouped_light PUT changes every
 // light at once, but the bridge paces those to about one per second (800 and 900 ms visibly stuttered).
 let flashInterval: Duration = .milliseconds(700)
 let flashTransition: Duration = .milliseconds(400)
 
+// Every Hue and SSM call gets this long, body included. A flash step is 700 ms, so a slower answer is no use,
+// and the worst case for a whole flash (two SSM reads, two GETs, the PUTs and the restore) stays inside the
+// 60-second Lambda timeout, so a hung Hue API is logged instead of killing the invocation mid-flash.
+let requestTimeout: Int64 = 5
+
 let awsClient = AWSClient()
-let ssm = SSM(client: awsClient, region: .useast1)
+let ssm = SSM(client: awsClient, region: .useast1, timeout: .seconds(requestTimeout))
 
 let runtime = LambdaRuntime { (event: DynamoDBEvent, context: LambdaContext) async throws -> Bool in
     context.logger.info("Received DynamoDB event: \(event)")
@@ -221,11 +227,14 @@ struct HueClient: Sendable {
     }
 
     func get<Resource: Decodable>(_ path: String, as type: Resource.Type, context: LambdaContext) async -> Resource? {
+        let request = request(.GET, path)
         do {
-            let response = try await HTTPClient.shared.execute(request(.GET, path), timeout: .seconds(30))
-            let body = try await response.body.collect(upTo: 1024 * 1024)
-            guard response.status == .ok else {
-                context.logger.error("GET \(path) failed with status \(response.status): \(String(buffer: body))")
+            let (status, body) = try await withTimeout(.seconds(requestTimeout)) {
+                let response = try await HTTPClient.shared.execute(request, timeout: .seconds(requestTimeout))
+                return (response.status, try await response.body.collect(upTo: 1024 * 1024))
+            }
+            guard status == .ok else {
+                context.logger.error("GET \(path) failed with status \(status): \(String(buffer: body))")
                 return nil
             }
             return try JSONDecoder().decode(Resource.self, from: Data(body.readableBytesView))
@@ -254,18 +263,19 @@ struct HueClient: Sendable {
         request.body = .bytes(ByteBuffer(bytes: body))
 
         do {
-            let response = try await HTTPClient.shared.execute(request, timeout: .seconds(30))
-            switch response.status {
+            let (status, responseBody) = try await withTimeout(.seconds(requestTimeout)) { [request] in
+                let response = try await HTTPClient.shared.execute(request, timeout: .seconds(requestTimeout))
+                return (response.status, try await response.body.collect(upTo: 64 * 1024))
+            }
+            switch status {
             case .ok:
                 context.logger.info("PUT \(path) succeeded")
                 return true
             case .multiStatus:
-                let responseBody = try await response.body.collect(upTo: 64 * 1024)
                 context.logger.warning("PUT \(path) returned 207, some lights unreachable: \(String(buffer: responseBody))")
                 return true
             default:
-                let responseBody = try await response.body.collect(upTo: 64 * 1024)
-                context.logger.error("PUT \(path) returned \(response.status): \(String(buffer: responseBody))")
+                context.logger.error("PUT \(path) returned \(status): \(String(buffer: responseBody))")
                 return false
             }
         } catch {

@@ -151,11 +151,12 @@ func addMonitoring(
         ]
     )
 
-    // The NCAA API returns the odd 502, which is harmless at 6 polls a minute. 20 failures in 15
-    // minutes means it has been down for a while.
+    // The NCAA API returns the odd 502 or slow answer, which is harmless at 6 polls a minute. The
+    // poller gives up on a hung request itself (timeouts are logged here, not counted as crashes), so
+    // 20 failures in 15 minutes means it has been down or hanging for a while.
     let scoresFeed = alarm(
         "scores-feed-failing",
-        description: "The poller logged 20 or more errors in 15 minutes: the NCAA scores API is down or DynamoDB writes are failing, so scores may be missed. Check the poller log group.",
+        description: "The poller logged 20 or more errors in 15 minutes: the NCAA scores API is down, hanging (look for timed out) or returning errors, or DynamoDB writes are failing, so scores may be missed. Check the poller log group.",
         threshold: 20,
         metrics: [
             metric("errors", "ScoresFeedErrors", namespace: namespace, period: 900),

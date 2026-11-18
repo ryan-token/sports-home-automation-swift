@@ -25,18 +25,21 @@ public func getSSMParameterValue(parameterName: String, ssm: SSM, context: Lambd
     }
 }
 
+// Hue rotates the refresh token on every refresh, so the new one is saved first: if saving the access token
+// then fails, the next run can still refresh, whereas losing the new refresh token would mean re-authorizing
+// Hue by hand.
 public func updateSSMParameters(tokenResponse: HueTokenResponse, ssm: SSM) async throws {
-    _ = try await ssm.putParameter(.init(
-        name: "hue-access-token",
-        overwrite: true,
-        type: .secureString,
-        value: tokenResponse.access_token
-    ))
-
     _ = try await ssm.putParameter(.init(
         name: "hue-refresh-token",
         overwrite: true,
         type: .secureString,
         value: tokenResponse.refresh_token
+    ))
+
+    _ = try await ssm.putParameter(.init(
+        name: "hue-access-token",
+        overwrite: true,
+        type: .secureString,
+        value: tokenResponse.access_token
     ))
 }

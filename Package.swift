@@ -74,6 +74,7 @@ let package = Package(
             name: "ScoreProcessor",
             dependencies: [
                 "Models",
+                "SharedUtils",
                 "SSMUtils",
                 .product(name: "AWSLambdaRuntime", package: "swift-aws-lambda-runtime"),
                 .product(name: "AWSLambdaEvents", package: "swift-aws-lambda-events"),
@@ -84,6 +85,7 @@ let package = Package(
         .executableTarget(
             name: "HueTokenRefresher",
             dependencies: [
+                "SharedUtils",
                 "SSMUtils",
                 .product(name: "AWSLambdaRuntime", package: "swift-aws-lambda-runtime"),
                 .product(name: "AWSLambdaEvents", package: "swift-aws-lambda-events"),

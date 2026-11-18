@@ -11,6 +11,7 @@ import AWSLambdaRuntime
 import Foundation
 import Models
 import NIOCore
+import SharedUtils
 import SotoSSM
 import SSMUtils
 
@@ -18,8 +19,12 @@ struct HueTokenRefresherCronJob: CloudwatchDetail {
     static let name = "hue-token-refresher-cron-job"
 }
 
+// Each call's limit, all inside the 60-second Lambda timeout (Project.swift), so a hung dependency is logged
+let ssmTimeout: Int64 = 5
+let hueTokenRequestTimeout: Int64 = 15
+
 let awsClient = AWSClient()
-let ssm = SSM(client: awsClient, region: .useast1)
+let ssm = SSM(client: awsClient, region: .useast1, timeout: .seconds(ssmTimeout))
 
 let runtime = LambdaRuntime { (event: HueTokenRefresherCronJob, context: LambdaContext) async throws -> Bool in
     context.logger.info("Received cron event: \(event)")
@@ -65,7 +70,7 @@ private func refreshHueTokens(clientId: String, clientSecret: String, refreshTok
     request.headers.add(name: "Content-Type", value: "application/x-www-form-urlencoded")
 
     // Add Basic Auth header
-    let authString = "\(clientId):\(clientSecret)".data(using: .utf8)!.base64EncodedString()
+    let authString = Data("\(clientId):\(clientSecret)".utf8).base64EncodedString()
     request.headers.add(name: "Authorization", value: "Basic \(authString)")
 
     let formData = "grant_type=refresh_token&refresh_token=\(refreshToken)"
@@ -73,12 +78,14 @@ private func refreshHueTokens(clientId: String, clientSecret: String, refreshTok
     buffer.writeString(formData)
     request.body = .bytes(buffer)
 
-    let response = try await HTTPClient.shared.execute(request, timeout: .seconds(30))
-    let body = try await response.body.collect(upTo: 1024 * 1024)
+    let (status, body) = try await withTimeout(.seconds(hueTokenRequestTimeout)) { [request] in
+        let response = try await HTTPClient.shared.execute(request, timeout: .seconds(hueTokenRequestTimeout))
+        return (response.status, try await response.body.collect(upTo: 1024 * 1024))
+    }
     let data = Data(body.readableBytesView)
 
-    guard (200...299).contains(response.status.code) else {
-        context.logger.error("Error: received response code of \(response.status.code)")
+    guard (200...299).contains(status.code) else {
+        context.logger.error("Error: received response code of \(status.code)")
         return nil
     }
 
